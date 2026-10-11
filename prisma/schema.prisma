@@ -1,0 +1,218 @@
+// Store Analytics — Prisma Schema
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+// ─── Shopify Session (required by @shopify/shopify-app-session-storage-prisma) ───
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// ─── Store — one record per installed shop ───────────────────────────────────
+model Store {
+  id        String   @id @default(cuid())
+  shop      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scans            Scan[]
+  problems         Problem[]
+  productSnapshots ProductSnapshot[]
+  salesSnapshots   SalesSnapshot[]
+  performanceTests PerformanceTest[]
+  themeScans       ThemeScan[]
+  themes           Theme[]
+}
+
+// ─── Scan — one record per diagnostic run ────────────────────────────────────
+model Scan {
+  id        String     @id @default(cuid())
+  shop      String
+  store     Store      @relation(fields: [shop], references: [shop])
+  status    String     @default("pending") // pending | running | complete | failed
+  type      String     @default("full")    // full | products | theme | seo | performance
+  startedAt DateTime   @default(now())
+  finishedAt DateTime?
+  progress  Int        @default(0)          // 0-100
+
+  results  ScanResult[]
+  problems Problem[]
+}
+
+// ─── ScanResult — raw findings from a scan ───────────────────────────────────
+model ScanResult {
+  id         String   @id @default(cuid())
+  scanId     String
+  scan       Scan     @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  category   String   // products | inventory | theme | seo | performance
+  key        String   // machine-readable result key
+  value      String   // JSON-encoded value
+  createdAt  DateTime @default(now())
+}
+
+// ─── Problem — a detected store issue ────────────────────────────────────────
+model Problem {
+  id           String    @id @default(cuid())
+  shop         String
+  store        Store     @relation(fields: [shop], references: [shop])
+  scanId       String?
+  scan         Scan?     @relation(fields: [scanId], references: [id])
+  severity     String    // CRITICAL | WARNING | NOTICE
+  fixType      String    // APP_FIX | DEV_FIX
+  category     String    // inventory | product | theme | seo | performance
+  title        String
+  description  String
+  whyItMatters String
+  resourceId   String?   // Shopify GID of affected resource
+  resourceType String?   // Product | Variant | Theme | etc.
+  resourceUrl  String?   // deep link into Shopify Admin
+  resolvedAt   DateTime?
+  ignoredAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// ─── ProductSnapshot — historical product data for trend reporting ────────────
+model ProductSnapshot {
+  id            String   @id @default(cuid())
+  shop          String
+  store         Store    @relation(fields: [shop], references: [shop])
+  shopifyId     String   // gid://shopify/Product/...
+  title         String
+  status        String
+  totalVariants Int
+  totalInventory Int
+  hasMedia      Boolean
+  hasDescription Boolean
+  priceMin      Float
+  priceMax      Float
+  snapshotDate  DateTime @default(now())
+
+  @@index([shop, snapshotDate])
+  @@index([shopifyId])
+}
+
+// ─── SalesSnapshot — aggregated sales data by day ────────────────────────────
+model SalesSnapshot {
+  id           String   @id @default(cuid())
+  shop         String
+  store        Store    @relation(fields: [shop], references: [shop])
+  date         DateTime // the day this snapshot covers (start of day UTC)
+  grossSales   Float    @default(0)
+  netSales     Float    @default(0)
+  orders       Int      @default(0)
+  unitsSold    Int      @default(0)
+  aov          Float    @default(0) // average order value
+  newCustomers Int      @default(0)
+  returning    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  @@unique([shop, date])
+  @@index([shop, date])
+}
+
+// ─── PerformanceTest — page speed test result ────────────────────────────────
+model PerformanceTest {
+  id            String   @id @default(cuid())
+  shop          String
+  store         Store    @relation(fields: [shop], references: [shop])
+  pageType      String   // home | product | collection | cart | search | blog | etc.
+  pageUrl       String
+  score         Int      // 0-100
+  lcp           Float?   // Largest Contentful Paint (ms)
+  inp           Float?   // Interaction to Next Paint (ms)
+  cls           Float?   // Cumulative Layout Shift
+  loadTime      Float?   // ms
+  pageSize      Int?     // bytes
+  requestCount  Int?
+  jsSize        Int?     // bytes
+  cssSize       Int?     // bytes
+  imageSize     Int?     // bytes
+  thirdParty    Int?     // third-party request count
+  testedAt      DateTime @default(now())
+
+  @@index([shop, pageType, testedAt])
+}
+
+// ─── Theme — cached theme metadata ───────────────────────────────────────────
+model Theme {
+  id         String   @id @default(cuid())
+  shop       String
+  store      Store    @relation(fields: [shop], references: [shop])
+  shopifyId  String   // gid://shopify/Theme/...
+  name       String
+  role       String   // main | unpublished | demo | development
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  themeScans ThemeScan[]
+
+  @@unique([shop, shopifyId])
+}
+
+// ─── ThemeScan — theme diagnostic results ────────────────────────────────────
+model ThemeScan {
+  id           String    @id @default(cuid())
+  shop         String
+  store        Store     @relation(fields: [shop], references: [shop])
+  themeId      String
+  theme        Theme     @relation(fields: [themeId], references: [id])
+  status       String    @default("pending") // pending | running | complete | failed
+  liquidIssues Int       @default(0)
+  jsIssues     Int       @default(0)
+  cssIssues    Int       @default(0)
+  assetIssues  Int       @default(0)
+  ghostScripts Int       @default(0)
+  rawResults   String?   // JSON-encoded detailed findings
+  scannedAt    DateTime  @default(now())
+
+  @@index([shop, themeId])
+}
+
+// ─── Subscription — SaaS plan and usage limits ───────────────────────────────
+model Subscription {
+  id        String   @id @default(cuid())
+  shop      String   @unique
+  plan      String   @default("Free") // Free | Growth | Enterprise
+  status    String   @default("active")
+  scanLimit Int      @default(50)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── AuditLog — modification and remediation audit log ───────────────────────
+model AuditLog {
+  id        String   @id @default(cuid())
+  shop      String
+  action    String   // SCAN | FIX_APPLIED | THEME_AUDIT | SETTINGS_UPDATED
+  resource  String
+  details   String?
+  createdAt DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+

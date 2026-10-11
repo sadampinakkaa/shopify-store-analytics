@@ -1,0 +1,29 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "10a15bbf29516134621c8aa9332c7b2a"
+application_url = "https://example.com"
+embedded = true
+name = "store analytics"
+
+[access_scopes]
+# Store Analytics requires broad read access for analytics, diagnostics, and theme scanning.
+# write_themes is required for theme fix operations (only applied to explicitly selected theme).
+scopes = "read_products,write_products,read_orders,read_customers,read_inventory,read_themes,write_themes,read_analytics,read_reports,write_metaobjects,write_metaobject_definitions,read_metaobjects"
+
+[webhooks]
+api_version = "2026-10"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+[auth]
+redirect_urls = [ "https://example.com/api/auth" ]
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true

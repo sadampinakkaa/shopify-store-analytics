@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useLoaderData, useRevalidator, useRouteError } from "react-router";
+import { useState, useMemo } from "react";
+import { useLoaderData, useFetcher, useRevalidator, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
@@ -8,16 +8,17 @@ import {
   fetchStoreCatalog,
   computeProductIntelligence,
 } from "../services/analytics.server";
+import { executeAppFix } from "../services/fixes.server";
 
 const PERIODS = [
-  { label: "30D", days: 30, sinceExpr: "-30d" },
-  { label: "90D", days: 90, sinceExpr: "-90d" },
-  { label: "180D", days: 180, sinceExpr: "-180d" },
-  { label: "1Y", days: 365, sinceExpr: "-365d" },
+  { label: "30D", days: 30 },
+  { label: "90D", days: 90 },
+  { label: "180D", days: 180 },
+  { label: "1Y", days: 365 },
 ];
 
 function fmtMoney(val) {
-  if (val == null) return "$0";
+  if (val == null || isNaN(val)) return "$0";
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
@@ -26,7 +27,7 @@ function fmtMoney(val) {
 }
 
 function fmtNum(val) {
-  if (val == null) return "0";
+  if (val == null || isNaN(val)) return "0";
   return new Intl.NumberFormat("en-US").format(val);
 }
 
@@ -50,11 +51,55 @@ export const loader = async ({ request }) => {
   };
 };
 
-export default function ProductsPage() {
-  const { shop, periodDays, allProducts, bestSellers, leastOrdered, slowMoving } = useLoaderData();
-  const revalidator = useRevalidator();
+export const action = async ({ request }) => {
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+  const intent = formData.get("intent");
 
-  const [activeTab, setActiveTab] = useState("bestsellers"); // 'bestsellers' | 'slowmoving' | 'leastordered' | 'funnel' | 'all'
+  if (intent === "product_fix") {
+    const actionKey = formData.get("actionKey");
+    const resourceId = formData.get("resourceId");
+    const resourceTitle = formData.get("resourceTitle");
+
+    try {
+      const result = await executeAppFix(admin, session.shop, {
+        actionKey,
+        resourceId,
+        resourceTitle,
+      });
+      return {
+        success: true,
+        message: result?.message || "Remediation applied successfully!",
+        fixedId: resourceId,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Failed to execute fix." };
+    }
+  }
+
+  return { success: false, error: "Invalid action intent" };
+};
+
+export default function ProductsPage() {
+  const {
+    shop,
+    periodDays,
+    allProducts,
+    bestSellers,
+    leastOrdered,
+    slowMoving,
+    stockoutRisk,
+    deadStock,
+    stats,
+  } = useLoaderData();
+
+  const revalidator = useRevalidator();
+  const fixFetcher = useFetcher();
+
+  const [activeTab, setActiveTab] = useState("bestsellers"); // 'bestsellers' | 'stockout' | 'slowmoving' | 'leastordered' | 'funnel' | 'all'
+  const [searchTerm, setSearchTerm] = useState("");
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const [selectedProduct, setSelectedProduct] = useState(null);
 
   const handlePeriodChange = (days) => {
     const url = new URL(window.location.href);
@@ -67,6 +112,8 @@ export default function ProductsPage() {
     switch (status) {
       case "Healthy":
         return "sa-badge success";
+      case "Stockout Risk":
+        return "sa-badge critical";
       case "Slow Moving":
         return "sa-badge warning";
       case "Very Slow":
@@ -80,14 +127,112 @@ export default function ProductsPage() {
     }
   };
 
+  const getUrgencyBadge = (urgency, daysOfSupply) => {
+    switch (urgency) {
+      case "EMERGENCY":
+        return (
+          <span className="sa-badge critical" title="Less than 7 days of inventory remaining">
+            🚨 &lt; 7 Days ({daysOfSupply}d)
+          </span>
+        );
+      case "HIGH":
+        return (
+          <span className="sa-badge warning" title="Less than 14 days of inventory remaining">
+            ⚠️ &lt; 14 Days ({daysOfSupply}d)
+          </span>
+        );
+      case "MODERATE":
+        return (
+          <span className="sa-badge notice" title="15-30 days of inventory remaining">
+            🟡 &lt; 30 Days ({daysOfSupply}d)
+          </span>
+        );
+      case "OUT_OF_STOCK":
+        return <span className="sa-badge critical">Out of Stock</span>;
+      case "DEAD_STOCK":
+        return <span className="sa-badge critical">Dead Stock</span>;
+      case "OVERSTOCK":
+        return <span className="sa-badge neutral">Overstocked (&gt;180d)</span>;
+      default:
+        return <span className="sa-badge success">Healthy ({daysOfSupply}d)</span>;
+    }
+  };
+
+  // Filtered catalog for "All" tab or search across active tab
+  const filteredCatalog = useMemo(() => {
+    let list = allProducts;
+    if (searchTerm.trim()) {
+      const q = searchTerm.toLowerCase().trim();
+      list = list.filter((p) => p.title.toLowerCase().includes(q));
+    }
+    if (statusFilter !== "ALL") {
+      list = list.filter((p) => p.velocityStatus === statusFilter);
+    }
+    return list;
+  }, [allProducts, searchTerm, statusFilter]);
+
+  // Export product intelligence report CSV
+  const handleExportCSV = () => {
+    if (!allProducts.length) return;
+    const headers = [
+      "Product Title",
+      "Current Stock",
+      "Price",
+      "Units Sold",
+      "Orders",
+      "Total Revenue",
+      "Daily Velocity",
+      "Weekly Velocity",
+      "Days of Supply",
+      "Stock Status",
+      "Trapped Inventory Value",
+    ];
+    const rows = allProducts.map((p) => [
+      `"${p.title.replace(/"/g, '""')}"`,
+      p.inventory,
+      p.price,
+      p.unitsSold,
+      p.orders,
+      p.revenue,
+      p.velocity,
+      p.weeklyVelocity,
+      p.daysOfSupply,
+      p.velocityStatus,
+      p.stockValue,
+    ]);
+    const csvContent =
+      "data:text/csv;charset=utf-8," +
+      [headers.join(","), ...rows.map((e) => e.join(","))].join("\n");
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `product_intelligence_${periodDays}d.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Quick 1-Click fix execution
+  const handleQuickFix = (product, actionKey) => {
+    fixFetcher.submit(
+      {
+        intent: "product_fix",
+        actionKey,
+        resourceId: product.id,
+        resourceTitle: product.title,
+      },
+      { method: "POST" }
+    );
+  };
+
   return (
     <div className="sa-page sa-fade-in">
       {/* Header */}
       <div className="sa-page-header">
         <div>
-          <div className="sa-page-title">Product Intelligence</div>
+          <div className="sa-page-title">Product Intelligence & Diagnostics</div>
           <div className="sa-page-subtitle">
-            Sales velocity, inventory turnover, best sellers, and slow-moving stock
+            Sales velocity, inventory turnover, dead stock capital, and stockout risk forecasts
           </div>
         </div>
         <div className="sa-inline">
@@ -102,33 +247,103 @@ export default function ProductsPage() {
               </button>
             ))}
           </div>
+          <button
+            onClick={handleExportCSV}
+            className="sa-btn sa-btn-secondary"
+            style={{ fontSize: 12, padding: "5px 12px" }}
+            title="Download product diagnostics as CSV"
+          >
+            📥 Export CSV
+          </button>
         </div>
       </div>
 
-      {/* Summary KPI Cards */}
+      {/* Action Notification Toast */}
+      {fixFetcher.data && (
+        <div
+          className="sa-card"
+          style={{
+            marginBottom: "var(--sa-space-5)",
+            padding: "12px 16px",
+            borderColor: fixFetcher.data.success ? "var(--sa-emerald)" : "var(--sa-rose)",
+            background: fixFetcher.data.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span>{fixFetcher.data.success ? "✅" : "⚠️"}</span>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>
+              {fixFetcher.data.message || fixFetcher.data.error}
+            </div>
+          </div>
+          <button
+            onClick={() => fixFetcher.data = null}
+            className="sa-btn sa-btn-ghost"
+            style={{ padding: "2px 8px", fontSize: 11 }}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Summary Diagnostic KPI Cards */}
       <div className="sa-metrics-grid">
         <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-emerald)" }}>
-          <div className="sa-metric-label">Active Catalog Products</div>
-          <div className="sa-metric-value">{fmtNum(allProducts.length)}</div>
+          <div className="sa-metric-label">Active Catalog SKUs</div>
+          <div className="sa-metric-value">{fmtNum(stats?.totalProducts || allProducts.length)}</div>
+          <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+            {fmtNum(stats?.activeSelling || 0)} generating orders
+          </div>
         </div>
-        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-indigo)" }}>
-          <div className="sa-metric-label">Products With Sales</div>
-          <div className="sa-metric-value">{fmtNum(bestSellers.length)}</div>
-        </div>
-        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-amber)" }}>
-          <div className="sa-metric-label">Slow-Moving Stock</div>
-          <div className="sa-metric-value">{fmtNum(slowMoving.length)}</div>
-        </div>
+
         <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-rose)" }}>
-          <div className="sa-metric-label">Dead Stock SKUs</div>
-          <div className="sa-metric-value">
-            {fmtNum(allProducts.filter((p) => p.velocityStatus === "Dead Stock").length)}
+          <div className="sa-metric-label">🚨 Stockout Risks (&lt;30d)</div>
+          <div className="sa-metric-value" style={{ color: "var(--sa-rose)" }}>
+            {fmtNum(stats?.stockoutRiskCount || stockoutRisk.length)}
+          </div>
+          <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+            {fmtMoney(stats?.revenueAtRisk || 0)} bi-weekly rev at risk
+          </div>
+        </div>
+
+        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-amber)" }}>
+          <div className="sa-metric-label">🐢 Dead Stock SKUs</div>
+          <div className="sa-metric-value" style={{ color: "var(--sa-amber)" }}>
+            {fmtNum(stats?.deadStockCount || deadStock.length)}
+          </div>
+          <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+            0 sales in {periodDays} days
+          </div>
+        </div>
+
+        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-violet)" }}>
+          <div className="sa-metric-label">Trapped Dead Capital</div>
+          <div className="sa-metric-value">{fmtMoney(stats?.deadStockCapital || 0)}</div>
+          <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+            Capital tied up in unsellable stock
+          </div>
+        </div>
+
+        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-cyan)" }}>
+          <div className="sa-metric-label">Out of Stock SKUs</div>
+          <div className="sa-metric-value">{fmtNum(stats?.outOfStockCount || 0)}</div>
+          <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+            Active items with 0 inventory
           </div>
         </div>
       </div>
 
-      {/* Navigation Tabs */}
-      <div style={{ display: "flex", gap: "var(--sa-space-2)", margin: "var(--sa-space-6) 0 var(--sa-space-4)" }}>
+      {/* Navigation Tabs Bar */}
+      <div
+        style={{
+          display: "flex",
+          gap: "var(--sa-space-2)",
+          margin: "var(--sa-space-6) 0 var(--sa-space-4)",
+          flexWrap: "wrap",
+        }}
+      >
         <button
           className={`sa-date-pill${activeTab === "bestsellers" ? " active" : ""}`}
           onClick={() => setActiveTab("bestsellers")}
@@ -136,10 +351,16 @@ export default function ProductsPage() {
           🏆 Best Sellers ({bestSellers.length})
         </button>
         <button
+          className={`sa-date-pill${activeTab === "stockout" ? " active" : ""}`}
+          onClick={() => setActiveTab("stockout")}
+        >
+          🚨 Stockout Risks ({stockoutRisk.length})
+        </button>
+        <button
           className={`sa-date-pill${activeTab === "slowmoving" ? " active" : ""}`}
           onClick={() => setActiveTab("slowmoving")}
         >
-          🐢 Slow-Moving & Dead Stock ({slowMoving.length})
+          🐢 Slow & Dead Stock ({slowMoving.length})
         </button>
         <button
           className={`sa-date-pill${activeTab === "leastordered" ? " active" : ""}`}
@@ -161,30 +382,45 @@ export default function ProductsPage() {
         </button>
       </div>
 
-      {/* Tab 1: Best Sellers */}
+      {/* Tab 1: 🏆 Best Sellers */}
       {activeTab === "bestsellers" && (
         <div className="sa-card">
           <div className="sa-card-header">
-            <div className="sa-card-title">Top Selling Products</div>
-            <span className="sa-badge success">Ranked by revenue</span>
+            <div>
+              <div className="sa-card-title">Top Selling Products</div>
+              <div className="sa-text-muted sa-text-small">
+                Ranked by gross revenue and weekly inventory turnover velocity
+              </div>
+            </div>
+            <span className="sa-badge success">{periodDays} Day Window</span>
           </div>
           <div className="sa-card-body no-pad">
             {bestSellers.length > 0 ? (
               <table className="sa-table">
                 <thead>
                   <tr>
+                    <th>Rank</th>
                     <th>Product</th>
                     <th>Units Sold</th>
                     <th>Orders</th>
                     <th>Revenue</th>
-                    <th>Weekly Velocity</th>
+                    <th>Velocity / wk</th>
                     <th>In Stock</th>
+                    <th>Days of Supply</th>
                     <th>Status</th>
+                    <th>Action</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {bestSellers.map((p) => (
-                    <tr key={p.id}>
+                  {bestSellers.map((p, idx) => (
+                    <tr
+                      key={p.id}
+                      style={{ cursor: "pointer" }}
+                      onClick={() => setSelectedProduct(p)}
+                    >
+                      <td style={{ fontWeight: 700, color: idx < 3 ? "var(--sa-amber)" : "var(--sa-text-muted)" }}>
+                        #{idx + 1}
+                      </td>
                       <td>
                         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                           {p.imageUrl ? (
@@ -194,11 +430,26 @@ export default function ProductsPage() {
                               style={{ width: 36, height: 36, borderRadius: 6, objectFit: "cover" }}
                             />
                           ) : (
-                            <div style={{ width: 36, height: 36, borderRadius: 6, background: "var(--sa-surface-3)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <div
+                              style={{
+                                width: 36,
+                                height: 36,
+                                borderRadius: 6,
+                                background: "var(--sa-surface-3)",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                              }}
+                            >
                               📦
                             </div>
                           )}
-                          <div style={{ fontWeight: 600 }}>{p.title}</div>
+                          <div>
+                            <div style={{ fontWeight: 600 }}>{p.title}</div>
+                            <div className="sa-text-muted" style={{ fontSize: 11 }}>
+                              {fmtMoney(p.price)}
+                            </div>
+                          </div>
                         </div>
                       </td>
                       <td>{fmtNum(p.unitsSold)}</td>
@@ -206,8 +457,21 @@ export default function ProductsPage() {
                       <td style={{ fontWeight: 600, color: "var(--sa-emerald)" }}>{fmtMoney(p.revenue)}</td>
                       <td>{p.weeklyVelocity} / wk</td>
                       <td>{fmtNum(p.inventory)}</td>
+                      <td>{getUrgencyBadge(p.urgency, p.daysOfSupply)}</td>
                       <td>
                         <span className={getStatusBadgeClass(p.velocityStatus)}>{p.velocityStatus}</span>
+                      </td>
+                      <td>
+                        <a
+                          href={shop ? `https://${shop}/admin/products/${p.id.split("/").pop()}` : "#"}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="sa-btn sa-btn-ghost"
+                          style={{ padding: "4px 8px", fontSize: 11 }}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          Shopify ↗
+                        </a>
                       </td>
                     </tr>
                   ))}
@@ -226,7 +490,114 @@ export default function ProductsPage() {
         </div>
       )}
 
-      {/* Tab 2: Slow-Moving Stock */}
+      {/* Tab 2: 🚨 Stockout Risks (New problem analytics feature!) */}
+      {activeTab === "stockout" && (
+        <div className="sa-card">
+          <div className="sa-card-header">
+            <div>
+              <div className="sa-card-title">Impending Stockout Risk Forecast</div>
+              <div className="sa-text-muted sa-text-small">
+                High-demand products with less than 30 days of inventory supply remaining
+              </div>
+            </div>
+            <span className="sa-badge critical">{stockoutRisk.length} SKUs at risk</span>
+          </div>
+          <div className="sa-card-body no-pad">
+            {stockoutRisk.length > 0 ? (
+              <table className="sa-table">
+                <thead>
+                  <tr>
+                    <th>Product</th>
+                    <th>Current Stock</th>
+                    <th>Sales Velocity</th>
+                    <th>Est. Days Remaining</th>
+                    <th>Risk Urgency</th>
+                    <th>Est. Revenue At Risk</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stockoutRisk.map((p) => {
+                    const estRiskRev = Math.round(p.weeklyVelocity * p.price * 2);
+                    return (
+                      <tr
+                        key={p.id}
+                        style={{ cursor: "pointer" }}
+                        onClick={() => setSelectedProduct(p)}
+                      >
+                        <td>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            {p.imageUrl ? (
+                              <img
+                                src={p.imageUrl}
+                                alt=""
+                                style={{ width: 36, height: 36, borderRadius: 6, objectFit: "cover" }}
+                              />
+                            ) : (
+                              <div
+                                style={{
+                                  width: 36,
+                                  height: 36,
+                                  borderRadius: 6,
+                                  background: "var(--sa-surface-3)",
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                }}
+                              >
+                                📦
+                              </div>
+                            )}
+                            <div>
+                              <div style={{ fontWeight: 600 }}>{p.title}</div>
+                              <div className="sa-text-muted" style={{ fontSize: 11 }}>
+                                {fmtMoney(p.price)} / unit
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                        <td style={{ fontWeight: 700, color: p.inventory <= 5 ? "var(--sa-rose)" : "var(--sa-amber)" }}>
+                          {fmtNum(p.inventory)} units
+                        </td>
+                        <td>{p.weeklyVelocity} units/wk ({p.velocity}/day)</td>
+                        <td style={{ fontWeight: 700 }}>
+                          {p.daysOfSupply} days
+                        </td>
+                        <td>{getUrgencyBadge(p.urgency, p.daysOfSupply)}</td>
+                        <td style={{ fontWeight: 600, color: "var(--sa-rose)" }}>
+                          {fmtMoney(estRiskRev)}
+                        </td>
+                        <td>
+                          <a
+                            href={shop ? `https://${shop}/admin/products/${p.id.split("/").pop()}` : "#"}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="sa-btn sa-btn-secondary"
+                            style={{ padding: "4px 8px", fontSize: 11 }}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            Restock In Shopify ↗
+                          </a>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            ) : (
+              <div className="sa-empty">
+                <div className="sa-empty-icon">✨</div>
+                <div className="sa-empty-title">No stockout risks detected</div>
+                <div className="sa-empty-body">
+                  All active selling products currently have sufficient inventory supply.
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Tab 3: 🐢 Slow-Moving & Dead Stock Diagnostics */}
       {activeTab === "slowmoving" && (
         <div className="sa-card">
           <div className="sa-card-header">
@@ -236,6 +607,7 @@ export default function ProductsPage() {
                 Calculated by sales velocity relative to remaining inventory and days since last sale
               </div>
             </div>
+            <span className="sa-badge warning">{slowMoving.length} Products</span>
           </div>
           <div className="sa-card-body no-pad">
             {slowMoving.length > 0 ? (
@@ -245,7 +617,7 @@ export default function ProductsPage() {
                     <th>Product</th>
                     <th>Classification</th>
                     <th>Inventory Trapped</th>
-                    <th>Price</th>
+                    <th>Trapped Capital</th>
                     <th>Units Sold ({periodDays}d)</th>
                     <th>Daily Velocity</th>
                     <th>Action</th>
@@ -253,25 +625,47 @@ export default function ProductsPage() {
                 </thead>
                 <tbody>
                   {slowMoving.map((p) => (
-                    <tr key={p.id}>
+                    <tr
+                      key={p.id}
+                      style={{ cursor: "pointer" }}
+                      onClick={() => setSelectedProduct(p)}
+                    >
                       <td style={{ fontWeight: 600 }}>{p.title}</td>
                       <td>
                         <span className={getStatusBadgeClass(p.velocityStatus)}>{p.velocityStatus}</span>
                       </td>
                       <td style={{ fontWeight: 600 }}>{fmtNum(p.inventory)} units</td>
-                      <td>{fmtMoney(p.price)}</td>
+                      <td style={{ fontWeight: 600, color: "var(--sa-amber)" }}>
+                        {fmtMoney(p.stockValue)}
+                      </td>
                       <td>{fmtNum(p.unitsSold)}</td>
                       <td>{p.velocity} / day</td>
                       <td>
-                        <a
-                          href={shop ? `https://${shop}/admin/products/${p.id.split("/").pop()}` : `https://admin.shopify.com/store`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="sa-btn sa-btn-ghost"
-                          style={{ padding: "4px 8px", fontSize: 11 }}
-                        >
-                          View in Shopify ↗
-                        </a>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          {p.inventory <= 0 ? (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleQuickFix(p, "FIX_OUT_OF_STOCK");
+                              }}
+                              className="sa-btn sa-btn-secondary"
+                              style={{ padding: "3px 8px", fontSize: 11 }}
+                            >
+                              Set Draft
+                            </button>
+                          ) : (
+                            <a
+                              href={shop ? `https://${shop}/admin/products/${p.id.split("/").pop()}` : "#"}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="sa-btn sa-btn-ghost"
+                              style={{ padding: "3px 8px", fontSize: 11 }}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              Discount ↗
+                            </a>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -288,7 +682,7 @@ export default function ProductsPage() {
         </div>
       )}
 
-      {/* Tab 3: Least Ordered */}
+      {/* Tab 4: 📉 Least Ordered */}
       {activeTab === "leastordered" && (
         <div className="sa-card">
           <div className="sa-card-header">
@@ -304,17 +698,23 @@ export default function ProductsPage() {
                   <th>Units Sold</th>
                   <th>Inventory</th>
                   <th>Price</th>
+                  <th>Trapped Value</th>
                   <th>Status</th>
                 </tr>
               </thead>
               <tbody>
                 {leastOrdered.map((p) => (
-                  <tr key={p.id}>
+                  <tr
+                    key={p.id}
+                    style={{ cursor: "pointer" }}
+                    onClick={() => setSelectedProduct(p)}
+                  >
                     <td style={{ fontWeight: 600 }}>{p.title}</td>
                     <td>{fmtNum(p.orders)}</td>
                     <td>{fmtNum(p.unitsSold)}</td>
                     <td>{fmtNum(p.inventory)}</td>
                     <td>{fmtMoney(p.price)}</td>
+                    <td style={{ color: "var(--sa-amber)" }}>{fmtMoney(p.stockValue)}</td>
                     <td>
                       <span className={getStatusBadgeClass(p.velocityStatus)}>{p.velocityStatus}</span>
                     </td>
@@ -326,7 +726,7 @@ export default function ProductsPage() {
         </div>
       )}
 
-      {/* Tab 4: Product Funnel */}
+      {/* Tab 5: 📊 Product Funnel */}
       {activeTab === "funnel" && (
         <div className="sa-card">
           <div className="sa-card-header">
@@ -338,7 +738,14 @@ export default function ProductsPage() {
             </div>
           </div>
           <div className="sa-card-body">
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "var(--sa-space-4)", marginBottom: "var(--sa-space-6)" }}>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                gap: "var(--sa-space-4)",
+                marginBottom: "var(--sa-space-6)",
+              }}
+            >
               <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-cyan)" }}>
                 <div className="sa-metric-label">1. Product Views</div>
                 <div className="sa-metric-value">{fmtNum(allProducts.length * 45)}</div>
@@ -372,11 +779,15 @@ export default function ProductsPage() {
                 </tr>
               </thead>
               <tbody>
-                {allProducts.slice(0, 10).map((p) => {
+                {allProducts.slice(0, 15).map((p) => {
                   const estViews = Math.max(p.orders * 35, 20);
                   const convRate = estViews > 0 ? ((p.orders / estViews) * 100).toFixed(1) : "0.0";
                   return (
-                    <tr key={p.id}>
+                    <tr
+                      key={p.id}
+                      style={{ cursor: "pointer" }}
+                      onClick={() => setSelectedProduct(p)}
+                    >
                       <td style={{ fontWeight: 600 }}>{p.title}</td>
                       <td>{fmtNum(estViews)}</td>
                       <td>{fmtNum(Math.round(estViews * 0.12))}</td>
@@ -395,40 +806,275 @@ export default function ProductsPage() {
         </div>
       )}
 
-      {/* Tab 5: All Catalog */}
+      {/* Tab 6: 📦 All Catalog with Live Search & Filter */}
       {activeTab === "all" && (
         <div className="sa-card">
           <div className="sa-card-header">
-            <div className="sa-card-title">Complete Catalog Directory</div>
-            <span className="sa-badge neutral">{allProducts.length} items</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div className="sa-card-title">Complete Catalog Directory</div>
+              <span className="sa-badge neutral">{filteredCatalog.length} items</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <input
+                type="text"
+                placeholder="Search products..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                style={{
+                  background: "var(--sa-surface-2)",
+                  border: "1px solid var(--sa-border-subtle)",
+                  borderRadius: "var(--sa-radius-sm)",
+                  color: "var(--sa-text)",
+                  padding: "5px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  width: 180,
+                }}
+              />
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+                style={{
+                  background: "var(--sa-surface-2)",
+                  border: "1px solid var(--sa-border-subtle)",
+                  borderRadius: "var(--sa-radius-sm)",
+                  color: "var(--sa-text)",
+                  padding: "5px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                }}
+              >
+                <option value="ALL">All Statuses</option>
+                <option value="Healthy">Healthy</option>
+                <option value="Stockout Risk">Stockout Risk</option>
+                <option value="Slow Moving">Slow Moving</option>
+                <option value="Very Slow">Very Slow</option>
+                <option value="Dead Stock">Dead Stock</option>
+                <option value="Out of Stock">Out of Stock</option>
+              </select>
+            </div>
           </div>
           <div className="sa-card-body no-pad">
-            <table className="sa-table">
-              <thead>
-                <tr>
-                  <th>Product</th>
-                  <th>Price</th>
-                  <th>Stock</th>
-                  <th>Units Sold</th>
-                  <th>Revenue</th>
-                  <th>Velocity Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {allProducts.map((p) => (
-                  <tr key={p.id}>
-                    <td style={{ fontWeight: 600 }}>{p.title}</td>
-                    <td>{fmtMoney(p.price)}</td>
-                    <td>{fmtNum(p.inventory)}</td>
-                    <td>{fmtNum(p.unitsSold)}</td>
-                    <td>{fmtMoney(p.revenue)}</td>
-                    <td>
-                      <span className={getStatusBadgeClass(p.velocityStatus)}>{p.velocityStatus}</span>
-                    </td>
+            {filteredCatalog.length > 0 ? (
+              <table className="sa-table">
+                <thead>
+                  <tr>
+                    <th>Product</th>
+                    <th>Price</th>
+                    <th>Stock</th>
+                    <th>Units Sold</th>
+                    <th>Revenue</th>
+                    <th>Days of Supply</th>
+                    <th>Velocity Status</th>
+                    <th>Action</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {filteredCatalog.map((p) => (
+                    <tr
+                      key={p.id}
+                      style={{ cursor: "pointer" }}
+                      onClick={() => setSelectedProduct(p)}
+                    >
+                      <td>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          {p.imageUrl ? (
+                            <img
+                              src={p.imageUrl}
+                              alt=""
+                              style={{ width: 28, height: 28, borderRadius: 4, objectFit: "cover" }}
+                            />
+                          ) : (
+                            <div style={{ width: 28, height: 28, borderRadius: 4, background: "var(--sa-surface-3)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>
+                              📦
+                            </div>
+                          )}
+                          <span style={{ fontWeight: 600 }}>{p.title}</span>
+                        </div>
+                      </td>
+                      <td>{fmtMoney(p.price)}</td>
+                      <td style={{ fontWeight: p.inventory <= 0 ? 700 : 400, color: p.inventory <= 0 ? "var(--sa-rose)" : "inherit" }}>
+                        {fmtNum(p.inventory)}
+                      </td>
+                      <td>{fmtNum(p.unitsSold)}</td>
+                      <td>{fmtMoney(p.revenue)}</td>
+                      <td>{getUrgencyBadge(p.urgency, p.daysOfSupply)}</td>
+                      <td>
+                        <span className={getStatusBadgeClass(p.velocityStatus)}>{p.velocityStatus}</span>
+                      </td>
+                      <td>
+                        <a
+                          href={shop ? `https://${shop}/admin/products/${p.id.split("/").pop()}` : "#"}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="sa-btn sa-btn-ghost"
+                          style={{ padding: "3px 8px", fontSize: 11 }}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          Shopify ↗
+                        </a>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="sa-empty" style={{ padding: "var(--sa-space-8)" }}>
+                <div className="sa-empty-icon">🔍</div>
+                <div className="sa-empty-title">No products match your filter</div>
+                <div className="sa-empty-body">Try clearing your search query or status filter.</div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Product Diagnostics Quick Modal / Drawer */}
+      {selectedProduct && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0, 0, 0, 0.65)",
+            backdropFilter: "blur(4px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+            padding: 20,
+          }}
+          onClick={() => setSelectedProduct(null)}
+        >
+          <div
+            className="sa-card"
+            style={{
+              width: "100%",
+              maxWidth: 580,
+              background: "var(--sa-surface)",
+              boxShadow: "var(--sa-shadow-lg)",
+              border: "1px solid var(--sa-border)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="sa-card-header">
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 20 }}>🔍</span>
+                <div>
+                  <div className="sa-card-title">{selectedProduct.title}</div>
+                  <div className="sa-text-muted sa-text-small">Diagnostic Breakdown & Velocity</div>
+                </div>
+              </div>
+              <button
+                className="sa-btn sa-btn-ghost"
+                style={{ padding: "4px 8px" }}
+                onClick={() => setSelectedProduct(null)}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="sa-card-body">
+              <div style={{ display: "grid", gridTemplateColumns: "100px 1fr", gap: 16, marginBottom: 16 }}>
+                {selectedProduct.imageUrl ? (
+                  <img
+                    src={selectedProduct.imageUrl}
+                    alt=""
+                    style={{ width: 100, height: 100, borderRadius: 8, objectFit: "cover" }}
+                  />
+                ) : (
+                  <div
+                    style={{
+                      width: 100,
+                      height: 100,
+                      borderRadius: 8,
+                      background: "var(--sa-surface-3)",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontSize: 32,
+                    }}
+                  >
+                    📦
+                  </div>
+                )}
+                <div>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+                    <span className={getStatusBadgeClass(selectedProduct.velocityStatus)}>
+                      {selectedProduct.velocityStatus}
+                    </span>
+                    {getUrgencyBadge(selectedProduct.urgency, selectedProduct.daysOfSupply)}
+                  </div>
+                  <div style={{ fontSize: 13, color: "var(--sa-text-muted)", lineHeight: 1.5 }}>
+                    Price: <strong>{fmtMoney(selectedProduct.price)}</strong> · Current Inventory:{" "}
+                    <strong>{fmtNum(selectedProduct.inventory)} units</strong>
+                  </div>
+                  <div style={{ fontSize: 13, color: "var(--sa-text-muted)", marginTop: 4 }}>
+                    Trapped Capital Value: <strong>{fmtMoney(selectedProduct.stockValue)}</strong>
+                  </div>
+                </div>
+              </div>
+
+              {/* Diagnostic Metrics Grid */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 10,
+                  background: "var(--sa-surface-2)",
+                  padding: 14,
+                  borderRadius: "var(--sa-radius-sm)",
+                  marginBottom: 16,
+                }}
+              >
+                <div>
+                  <div className="sa-metric-label">Units Sold ({periodDays}d)</div>
+                  <div style={{ fontSize: 18, fontWeight: 700 }}>{fmtNum(selectedProduct.unitsSold)}</div>
+                </div>
+                <div>
+                  <div className="sa-metric-label">Gross Revenue</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-emerald)" }}>
+                    {fmtMoney(selectedProduct.revenue)}
+                  </div>
+                </div>
+                <div>
+                  <div className="sa-metric-label">Sales Velocity</div>
+                  <div style={{ fontSize: 14, fontWeight: 600 }}>
+                    {selectedProduct.weeklyVelocity} units / wk
+                  </div>
+                </div>
+                <div>
+                  <div className="sa-metric-label">Est. Days of Supply</div>
+                  <div style={{ fontSize: 14, fontWeight: 600 }}>
+                    {selectedProduct.daysOfSupply} days
+                  </div>
+                </div>
+              </div>
+
+              {/* Action buttons */}
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                {selectedProduct.inventory <= 0 && (
+                  <button
+                    onClick={() => {
+                      handleQuickFix(selectedProduct, "FIX_OUT_OF_STOCK");
+                      setSelectedProduct(null);
+                    }}
+                    className="sa-btn sa-btn-danger"
+                  >
+                    Unpublish to Draft
+                  </button>
+                )}
+                <a
+                  href={shop ? `https://${shop}/admin/products/${selectedProduct.id.split("/").pop()}` : "#"}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="sa-btn sa-btn-primary"
+                >
+                  Open in Shopify Admin ↗
+                </a>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -440,9 +1086,19 @@ export function ErrorBoundary() {
   const error = useRouteError();
   return (
     <div className="sa-page sa-fade-in">
-      <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
+      <div
+        className="sa-card"
+        style={{
+          padding: "var(--sa-space-6)",
+          maxWidth: 640,
+          margin: "40px auto",
+          textAlign: "center",
+        }}
+      >
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
-        <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load product intelligence</div>
+        <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>
+          Unable to load product intelligence
+        </div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
           {error?.message || "An unexpected error occurred while analyzing products."}
         </div>

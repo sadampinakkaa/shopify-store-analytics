@@ -1,427 +1,259 @@
-import { useState } from "react";
-import { useLoaderData, useRevalidator, useRouteError } from "react-router";
-import { useAppBridge } from "@shopify/app-bridge-react";
+import { useState, useMemo } from "react";
+import { useLoaderData, useFetcher, useRevalidator, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import {
+  getPeriodDates,
+  fetchStoreOrders,
+  fetchStoreCatalog,
+  computeSalesAnalytics,
+} from "../services/analytics.server";
+import { runStoreScan } from "../services/scanner.server";
+import { executeAppFix } from "../services/fixes.server";
+import prisma from "../db.server";
 
-// ─── DATE RANGE HELPERS ───────────────────────────────────────────────────────
 const DATE_RANGES = [
-  { label: "7D",  sinceExpr: "-7d",   untilExpr: "today" },
-  { label: "30D", sinceExpr: "-30d",  untilExpr: "today" },
-  { label: "90D", sinceExpr: "-90d",  untilExpr: "today" },
-  { label: "6M",  sinceExpr: "-180d", untilExpr: "today" },
-  { label: "1Y",  sinceExpr: "-365d", untilExpr: "today" },
+  { label: "7D", sinceExpr: "-7d" },
+  { label: "30D", sinceExpr: "-30d" },
+  { label: "90D", sinceExpr: "-90d" },
+  { label: "6M", sinceExpr: "-180d" },
+  { label: "1Y", sinceExpr: "-365d" },
 ];
 
 function fmtMoney(val) {
-  if (val == null) return "$—";
+  if (val == null || isNaN(val)) return "$0";
   return new Intl.NumberFormat("en-US", {
-    style: "currency", currency: "USD", maximumFractionDigits: 0,
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
   }).format(val);
 }
 
 function fmtNum(val) {
-  if (val == null) return "—";
+  if (val == null || isNaN(val)) return "0";
   return new Intl.NumberFormat("en-US").format(val);
 }
 
 function fmtPct(val) {
-  if (val == null) return "—";
-  return `${(val * 100).toFixed(1)}%`;
-}
-
-function extractShopifyQLRows(data, queryKey) {
-  try {
-    const rows = data?.[queryKey]?.tableData?.rows ?? [];
-    const cols = data?.[queryKey]?.tableData?.columns ?? [];
-    const colNames = cols.map((c) => c.name);
-    return rows.map((row) =>
-      Object.fromEntries(row.map((v, i) => [colNames[i], v]))
-    );
-  } catch {
-    return [];
-  }
-}
-
-function getSinceDate(sinceExpr) {
-  const now = new Date();
-  const match = String(sinceExpr || "").match(/-(\d+)d/);
-  const days = match ? parseInt(match[1], 10) : 30;
-  now.setDate(now.getDate() - days);
-  return now.toISOString().split("T")[0];
+  if (val == null || isNaN(val)) return "0%";
+  return `${val >= 0 ? "+" : ""}${val.toFixed(1)}%`;
 }
 
 // ─── LOADER ───────────────────────────────────────────────────────────────────
 export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
 
   const url = new URL(request.url);
   const since = url.searchParams.get("since") || "-30d";
-  const until = url.searchParams.get("until") || "today";
+  const periodDates = getPeriodDates(since);
 
-  let kpi = null;
-  let trendRows = null;
-  let customers = null;
-
-  // ── 1. Try ShopifyQL first (if store has read_reports & Level 2 PCD access) ───
+  // 1. Fetch Orders & Calculate Sales Analytics with Period-Over-Period Growth
+  let orders = [];
   try {
-    const [salesKpiRes, trendRes, customerRes] = await Promise.all([
-      admin.graphql(
-        `#graphql
-        query storeSalesKpi($query: String!) {
-          shopifyqlQuery(query: $query) {
-            tableData { columns { name dataType } rows }
-            parseErrors
-          }
-        }`,
-        {
-          variables: {
-            query: `FROM sales SHOW gross_sales, net_sales, orders, average_order_value SINCE ${since} UNTIL ${until}`,
-          },
-        }
-      ),
-      admin.graphql(
-        `#graphql
-        query salesTrend($query: String!) {
-          shopifyqlQuery(query: $query) {
-            tableData { columns { name dataType } rows }
-            parseErrors
-          }
-        }`,
-        {
-          variables: {
-            query: `FROM sales SHOW gross_sales, orders TIMESERIES day SINCE ${since} UNTIL ${until}`,
-          },
-        }
-      ),
-      admin.graphql(
-        `#graphql
-        query customerSegments($query: String!) {
-          shopifyqlQuery(query: $query) {
-            tableData { columns { name dataType } rows }
-            parseErrors
-          }
-        }`,
-        {
-          variables: {
-            query: `FROM customers SHOW customers GROUP BY customer_type SINCE ${since} UNTIL ${until}`,
-          },
-        }
-      ),
-    ]);
+    orders = await fetchStoreOrders(admin, periodDates.previousStartDate);
+  } catch (err) {
+    console.warn("Failed to fetch orders for dashboard:", err.message);
+  }
+  const salesAnalytics = computeSalesAnalytics(orders, periodDates);
 
-    const [salesKpiJson, trendJson, customerJson] = await Promise.all([
-      salesKpiRes.json(),
-      trendRes.json(),
-      customerRes.json(),
-    ]);
-
-    const kpiRows = extractShopifyQLRows(salesKpiJson?.data, "shopifyqlQuery");
-    if (kpiRows.length > 0) {
-      kpi = {
-        grossSales: parseFloat(kpiRows[0].gross_sales ?? 0),
-        netSales: parseFloat(kpiRows[0].net_sales ?? 0),
-        orders: parseInt(kpiRows[0].orders ?? 0, 10),
-        aov: parseFloat(kpiRows[0].average_order_value ?? 0),
-      };
-    }
-
-    const tRows = extractShopifyQLRows(trendJson?.data, "shopifyqlQuery");
-    if (tRows.length > 0) {
-      trendRows = tRows;
-    }
-
-    const custRows = extractShopifyQLRows(customerJson?.data, "shopifyqlQuery");
-    if (custRows.length > 0) {
-      const newCust = custRows.find((r) => r.customer_type === "new")?.customers ?? 0;
-      const retCust = custRows.find((r) => r.customer_type === "returning")?.customers ?? 0;
-      customers = { new: Number(newCust), returning: Number(retCust) };
-    }
-  } catch {
-    // Expected on development stores or apps without Level 2 Protected Customer Data approval.
-    // Fall back seamlessly to standard Admin GraphQL queries below.
+  // 2. Fetch Catalog Snapshot
+  let catalog = [];
+  try {
+    catalog = await fetchStoreCatalog(admin);
+  } catch (err) {
+    console.warn("Failed to fetch catalog for dashboard:", err.message);
   }
 
-  // ── 2. Fallback to Admin GraphQL Orders if ShopifyQL is unavailable ────────
-  if (!kpi) {
-    let orderNodes = [];
-    const sinceDate = getSinceDate(since);
+  // 3. Retrieve or Execute Problem Diagnostic Scan
+  let dbProblems = [];
+  let resolvedCount = 0;
+  try {
+    dbProblems = await prisma.problem.findMany({
+      where: { shop, resolvedAt: null },
+      orderBy: { createdAt: "desc" },
+    });
+    resolvedCount = await prisma.problem.count({
+      where: { shop, resolvedAt: { not: null } },
+    });
+  } catch (err) {
+    console.warn("Database lookup caught in dashboard loader:", err.message);
+  }
 
+  // If no diagnostic problems in DB, run a full store scan automatically
+  let scanStats = null;
+  let healthScore = 100;
+  if (dbProblems.length === 0) {
     try {
-      const ordersRes = await admin.graphql(
-        `#graphql
-        query storeOrdersWithCustomer($query: String!) {
-          orders(first: 250, query: $query) {
-            edges {
-              node {
-                id
-                createdAt
-                totalPriceSet {
-                  shopMoney { amount }
-                }
-                subtotalPriceSet {
-                  shopMoney { amount }
-                }
-                customer {
-                  id
-                  numberOfOrders
-                }
-              }
-            }
-          }
-        }`,
-        {
-          variables: {
-            query: `status:any created_at:>=${sinceDate}`,
-          },
-        }
-      );
-      const ordersJson = await ordersRes.json();
-      orderNodes = ordersJson.data?.orders?.edges?.map((e) => e.node) ?? [];
-    } catch {
-      // If customer field is restricted, fall back to basic orders query
-      try {
-        const basicOrdersRes = await admin.graphql(
-          `#graphql
-          query storeOrdersBasicOnly($query: String!) {
-            orders(first: 250, query: $query) {
-              edges {
-                node {
-                  id
-                  createdAt
-                  totalPriceSet {
-                    shopMoney { amount }
-                  }
-                  subtotalPriceSet {
-                    shopMoney { amount }
-                  }
-                }
-              }
-            }
-          }`,
-          {
-            variables: {
-              query: `status:any created_at:>=${sinceDate}`,
-            },
-          }
-        );
-        const basicOrdersJson = await basicOrdersRes.json();
-        orderNodes = basicOrdersJson.data?.orders?.edges?.map((e) => e.node) ?? [];
-      } catch {
-        orderNodes = [];
-      }
+      const scanResult = await runStoreScan(admin, shop);
+      dbProblems = scanResult.problems || [];
+      healthScore = scanResult.healthScore || 100;
+      scanStats = scanResult.stats;
+    } catch (scanErr) {
+      console.warn("Auto-scan failed in dashboard loader:", scanErr.message);
     }
+  }
 
-    let gross = 0;
-    let net = 0;
-    const dailyMap = {};
-    const customerOrderCounts = {};
+  // Calculate health metrics
+  const critCount = dbProblems.filter((p) => p.severity === "CRITICAL").length;
+  const warnCount = dbProblems.filter((p) => p.severity === "WARNING").length;
+  const notcCount = dbProblems.filter((p) => p.severity === "NOTICE").length;
 
-    for (const ord of orderNodes) {
-      const total = parseFloat(ord.totalPriceSet?.shopMoney?.amount || 0);
-      const subtotal = parseFloat(ord.subtotalPriceSet?.shopMoney?.amount || 0);
-      gross += total;
-      net += subtotal;
-
-      const day = ord.createdAt ? ord.createdAt.slice(0, 10) : "";
-      if (day) {
-        if (!dailyMap[day]) {
-          dailyMap[day] = { day, gross_sales: 0, orders: 0 };
-        }
-        dailyMap[day].gross_sales += total;
-        dailyMap[day].orders += 1;
-      }
-
-      const custId = ord.customer?.id;
-      if (custId) {
-        customerOrderCounts[custId] = (customerOrderCounts[custId] || 0) + 1;
-      }
-    }
-
-    const orderCount = orderNodes.length;
-    kpi = {
-      grossSales: Math.round(gross * 100) / 100,
-      netSales: Math.round(net * 100) / 100,
-      orders: orderCount,
-      aov: orderCount > 0 ? Math.round((gross / orderCount) * 100) / 100 : 0,
+  if (scanStats == null) {
+    healthScore = Math.max(0, 100 - (critCount * 15 + warnCount * 5 + notcCount * 2));
+    scanStats = {
+      critical: critCount,
+      warning: warnCount,
+      notice: notcCount,
+      total: dbProblems.length,
+      resolved: resolvedCount,
     };
-
-    trendRows = Object.keys(dailyMap)
-      .sort()
-      .map((day) => ({
-        day,
-        gross_sales: Math.round(dailyMap[day].gross_sales * 100) / 100,
-        orders: dailyMap[day].orders,
-      }));
-
-    let newCust = 0;
-    let retCust = 0;
-    const custValues = Object.values(customerOrderCounts);
-    if (custValues.length > 0) {
-      for (const count of custValues) {
-        if (count > 1) retCust++;
-        else newCust++;
-      }
-    } else {
-      newCust = orderCount;
-      retCust = 0;
-    }
-    customers = { new: newCust, returning: retCust };
   }
 
-  // Ensure safe defaults
-  if (!kpi) kpi = { grossSales: 0, netSales: 0, orders: 0, aov: 0 };
-  if (!trendRows) trendRows = [];
-  if (!customers) customers = { new: 0, returning: 0 };
+  // Category breakdown
+  const categoryCounts = {
+    inventory: dbProblems.filter((p) => p.category === "inventory").length,
+    product: dbProblems.filter((p) => p.category === "product").length,
+    seo: dbProblems.filter((p) => p.category === "seo").length,
+    performance: dbProblems.filter((p) => p.category === "performance").length,
+  };
 
-  // ── 3. Admin GraphQL: product & inventory snapshot ─────────────────────────
-  let allProducts = [];
-  let totalProducts = 0;
-
-  try {
-    const productsRes = await admin.graphql(
-      `#graphql
-      query storeSnapshot {
-        products(first: 250, query: "status:active") {
-          edges {
-            node {
-              id
-              title
-              status
-              totalInventory
-              hasOnlyDefaultVariant
-              media(first: 1) { edges { node { id } } }
-              variants(first: 5) {
-                edges {
-                  node {
-                    id
-                    price
-                    sku
-                    barcode
-                    inventoryQuantity
-                  }
-                }
-              }
-            }
-          }
-          pageInfo { hasNextPage }
-        }
-        productsCount { count }
-      }`
-    );
-    const productsJson = await productsRes.json();
-    allProducts = productsJson.data?.products?.edges?.map((e) => e.node) ?? [];
-    totalProducts = productsJson.data?.productsCount?.count ?? allProducts.length;
-  } catch (prodErr) {
-    console.warn("Product snapshot query failed:", prodErr.message);
+  // Customers calculation
+  const customerCounts = {};
+  for (const o of orders) {
+    const cid = o.customer?.id;
+    if (cid) customerCounts[cid] = (customerCounts[cid] || 0) + 1;
+  }
+  let newCust = 0;
+  let retCust = 0;
+  const custVals = Object.values(customerCounts);
+  if (custVals.length > 0) {
+    for (const cnt of custVals) {
+      if (cnt > 1) retCust++;
+      else newCust++;
+    }
+  } else {
+    newCust = salesAnalytics.kpi.orders;
+    retCust = 0;
   }
 
-  // ── Parse product diagnostics ──────────────────────────────────────────────
-  let criticalCount = 0;
-  let warningCount = 0;
-  let noticeCount = 0;
-
-  const problems = [];
-
-  for (const p of allProducts) {
-    // CRITICAL: out of stock active product
-    if ((p.totalInventory ?? 0) <= 0) {
-      criticalCount++;
-      problems.push({
-        id: p.id,
-        severity: "CRITICAL",
-        title: "Active Product Out of Stock",
-        desc: `"${p.title}" has no inventory`,
-        fixType: "APP_FIX",
-      });
-    }
-
-    // CRITICAL: no media
-    const hasMedia = (p.media?.edges?.length ?? 0) > 0;
-    if (!hasMedia) {
-      criticalCount++;
-      problems.push({
-        id: `${p.id}-media`,
-        severity: "CRITICAL",
-        title: "Active Product Without Media",
-        desc: `"${p.title}" has no images`,
-        fixType: "DEV_FIX",
-      });
-    }
-
-    // CRITICAL: $0 variant
-    for (const ve of p.variants?.edges ?? []) {
-      const v = ve.node;
-      if (parseFloat(v.price ?? "0") === 0) {
-        criticalCount++;
-        problems.push({
-          id: `${v.id}-price`,
-          severity: "CRITICAL",
-          title: "$0.00 Price on Active Variant",
-          desc: `"${p.title}" has a variant priced at $0.00`,
-          fixType: "DEV_FIX",
-        });
-      }
-
-      // WARNING: missing SKU
-      if (!v.sku && !v.barcode) {
-        warningCount++;
-      }
-    }
-  }
-
-  // Health score: 100 - (CRITICAL×15 + WARNING×5 + NOTICE×2), min 0
-  const healthScore = Math.max(0, 100 - (criticalCount * 15 + warningCount * 5 + noticeCount * 2));
+  // Catalog quick stats
+  const outOfStockCount = catalog.filter((p) => (p.totalInventory ?? 0) <= 0).length;
+  const lowStockCount = catalog.filter((p) => {
+    const inv = p.totalInventory ?? 0;
+    return inv > 0 && inv <= 5;
+  }).length;
 
   return {
+    shop,
     since,
-    until,
-    kpi,
-    trendRows,
-    customers,
-    products: { total: totalProducts, active: allProducts.length },
-    health: { score: healthScore, critical: criticalCount, warning: warningCount, notice: noticeCount },
-    problems: problems.slice(0, 5),
+    kpi: salesAnalytics.kpi,
+    trendRows: salesAnalytics.trendRows,
+    summary: salesAnalytics.summary,
+    salesAnomalies: salesAnalytics.anomalies || [],
+    health: {
+      score: healthScore,
+      ...scanStats,
+      categories: categoryCounts,
+    },
+    topProblems: dbProblems.slice(0, 6),
+    catalogStats: {
+      total: catalog.length,
+      outOfStock: outOfStockCount,
+      lowStock: lowStockCount,
+    },
+    customers: {
+      new: newCust,
+      returning: retCust,
+      total: newCust + retCust,
+    },
   };
+};
+
+// ─── ACTION ───────────────────────────────────────────────────────────────────
+export const action = async ({ request }) => {
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "quick_fix") {
+    const problemId = formData.get("problemId");
+    const actionKey = formData.get("actionKey");
+    const resourceId = formData.get("resourceId");
+    const resourceTitle = formData.get("resourceTitle");
+
+    try {
+      const result = await executeAppFix(admin, session.shop, {
+        problemId,
+        actionKey,
+        resourceId,
+        resourceTitle,
+      });
+      return {
+        success: true,
+        message: result?.message || "Remediation applied successfully!",
+        fixedId: problemId,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Failed to execute fix." };
+    }
+  }
+
+  if (intent === "rescan") {
+    try {
+      const scanData = await runStoreScan(admin, session.shop);
+      return {
+        success: true,
+        message: `Diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health score: ${scanData.healthScore}/100.`,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Scan failed." };
+    }
+  }
+
+  return { success: false, error: "Invalid action intent" };
 };
 
 // ─── HEALTH RING SVG ──────────────────────────────────────────────────────────
 function HealthRing({ score }) {
-  const r = 52;
+  const r = 50;
   const circ = 2 * Math.PI * r;
   const progress = ((100 - score) / 100) * circ;
-  const color = score >= 80 ? "var(--sa-emerald)" : score >= 50 ? "var(--sa-amber)" : "var(--sa-rose)";
+  const color =
+    score >= 80 ? "var(--sa-emerald)" : score >= 50 ? "var(--sa-amber)" : "var(--sa-rose)";
 
   return (
     <div className="sa-health-ring">
-      <svg width="140" height="140" viewBox="0 0 140 140">
-        <circle cx="70" cy="70" r={r} fill="none" stroke="var(--sa-surface-3)" strokeWidth="12" />
+      <svg width="130" height="130" viewBox="0 0 130 130">
+        <circle cx="65" cy="65" r={r} fill="none" stroke="var(--sa-surface-3)" strokeWidth="10" />
         <circle
-          cx="70" cy="70" r={r}
+          cx="65"
+          cy="65"
+          r={r}
           fill="none"
           stroke={color}
-          strokeWidth="12"
+          strokeWidth="10"
           strokeDasharray={circ}
           strokeDashoffset={progress}
           strokeLinecap="round"
-          transform="rotate(-90 70 70)"
+          transform="rotate(-90 65 65)"
           style={{ transition: "stroke-dashoffset 0.8s ease" }}
         />
         <text
-          x="70"
-          y="68"
+          x="65"
+          y="62"
           textAnchor="middle"
           dominantBaseline="middle"
           fill={color}
-          fontSize="30"
+          fontSize="28"
           fontWeight="700"
           fontFamily="Inter, sans-serif"
         >
           {score}
         </text>
         <text
-          x="70"
-          y="88"
+          x="65"
+          y="82"
           textAnchor="middle"
           dominantBaseline="middle"
           fill="var(--sa-text-muted)"
@@ -432,7 +264,9 @@ function HealthRing({ score }) {
           /100
         </text>
       </svg>
-      <div className="sa-health-score-sub">Store Health Score</div>
+      <div className="sa-health-score-sub" style={{ fontWeight: 600 }}>
+        Store Diagnostic Health
+      </div>
     </div>
   );
 }
@@ -445,11 +279,11 @@ function Sparkline({ data = [], color = "var(--sa-emerald)" }) {
   const min = Math.min(...vals);
   const max = Math.max(...vals);
   const range = max - min || 1;
-  const w = 200;
-  const h = 40;
+  const w = 180;
+  const h = 36;
   const pts = vals
     .map((v, i) => {
-      const x = (i / (vals.length - 1)) * w;
+      const x = (i / Math.max(vals.length - 1, 1)) * w;
       const y = h - ((v - min) / range) * (h - 4) - 2;
       return `${x},${y}`;
     })
@@ -457,15 +291,9 @@ function Sparkline({ data = [], color = "var(--sa-emerald)" }) {
 
   return (
     <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="sa-sparkline">
-      <defs>
-        <linearGradient id={`grad-${color.replace(/[^a-z]/gi,"")}`} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
       <polyline
         points={pts}
-        fill={`url(#grad-${color.replace(/[^a-z]/gi,"")})`}
+        fill="none"
         stroke={color}
         strokeWidth="1.5"
         strokeLinejoin="round"
@@ -475,7 +303,7 @@ function Sparkline({ data = [], color = "var(--sa-emerald)" }) {
 }
 
 // ─── METRIC CARD ─────────────────────────────────────────────────────────────
-function MetricCard({ label, value, delta, accent = "var(--sa-emerald)", sparkData }) {
+function MetricCard({ label, value, delta, accent = "var(--sa-emerald)", sparkData, subtitle }) {
   const isPositive = delta > 0;
   const isNeutral = delta === 0 || delta == null;
 
@@ -483,42 +311,37 @@ function MetricCard({ label, value, delta, accent = "var(--sa-emerald)", sparkDa
     <div className="sa-metric-card" style={{ "--sa-accent": accent }}>
       <div className="sa-metric-label">{label}</div>
       <div className="sa-metric-value">{value}</div>
-      {!isNeutral && (
+      {!isNeutral ? (
         <span className={`sa-metric-delta ${isPositive ? "up" : "down"}`}>
-          {isPositive ? "↑" : "↓"} {Math.abs(delta)}%
+          {isPositive ? "↑" : "↓"} {Math.abs(delta)}% vs prev
         </span>
+      ) : subtitle ? (
+        <div className="sa-text-muted sa-text-small">{subtitle}</div>
+      ) : (
+        <span className="sa-metric-delta neutral">Period baseline</span>
       )}
-      {sparkData && <Sparkline data={sparkData} color={accent} />}
+      {sparkData && sparkData.length > 1 && <Sparkline data={sparkData} color={accent} />}
     </div>
   );
 }
 
-// ─── PROBLEM CARD ─────────────────────────────────────────────────────────────
-function ProblemItem({ problem }) {
-  const severityClass = problem.severity === "CRITICAL"
-    ? "critical" : problem.severity === "WARNING" ? "warning" : "notice";
-  const fixClass = problem.fixType === "APP_FIX" ? "app-fix" : "dev-fix";
-  const fixLabel = problem.fixType === "APP_FIX" ? "App Fix" : "Dev Fix";
-
-  return (
-    <div className="sa-problem-card">
-      <div className="sa-problem-card-header">
-        <div className="sa-problem-title">{problem.title}</div>
-        <div className="sa-problem-badges">
-          <span className={`sa-badge ${severityClass}`}>{problem.severity}</span>
-          <span className={`sa-badge ${fixClass}`}>{fixLabel}</span>
-        </div>
-      </div>
-      <div className="sa-problem-desc">{problem.desc}</div>
-    </div>
-  );
-}
-
-// ─── PAGE COMPONENT ───────────────────────────────────────────────────────────
+// ─── DASHBOARD PAGE ───────────────────────────────────────────────────────────
 export default function OverviewPage() {
-  const { kpi, trendRows, customers, products, health, problems, since } = useLoaderData();
-  const shopify = useAppBridge();
+  const {
+    shop,
+    since,
+    kpi,
+    trendRows,
+    summary,
+    salesAnomalies,
+    health,
+    topProblems,
+    catalogStats,
+    customers,
+  } = useLoaderData();
+
   const revalidator = useRevalidator();
+  const actionFetcher = useFetcher();
 
   const [activePeriod, setActivePeriod] = useState(
     DATE_RANGES.findIndex((r) => r.sinceExpr === since) !== -1
@@ -526,31 +349,52 @@ export default function OverviewPage() {
       : 1
   );
 
+  const [chartView, setChartView] = useState("revenue"); // 'revenue' | 'orders'
+
   const revenueSparkData = trendRows.map((r) => r.gross_sales ?? 0);
-  const ordersSparkData  = trendRows.map((r) => r.orders ?? 0);
+  const ordersSparkData = trendRows.map((r) => r.orders ?? 0);
 
   const totalCustomers = customers.new + customers.returning;
-  const returningRate = totalCustomers > 0
-    ? `${((customers.returning / totalCustomers) * 100).toFixed(0)}% returning`
-    : null;
+  const returningRate =
+    totalCustomers > 0 ? `${((customers.returning / totalCustomers) * 100).toFixed(0)}%` : "0%";
 
   const handlePeriodChange = (idx) => {
     setActivePeriod(idx);
-    const { sinceExpr, untilExpr } = DATE_RANGES[idx];
+    const { sinceExpr } = DATE_RANGES[idx];
     const url = new URL(window.location.href);
     url.searchParams.set("since", sinceExpr);
-    url.searchParams.set("until", untilExpr);
     window.history.pushState({}, "", url);
     revalidator.revalidate();
   };
+
+  const handleRunScan = () => {
+    actionFetcher.submit({ intent: "rescan" }, { method: "POST" });
+  };
+
+  const handleQuickFix = (problem) => {
+    actionFetcher.submit(
+      {
+        intent: "quick_fix",
+        problemId: problem.id,
+        actionKey: problem.actionKey || "",
+        resourceId: problem.resourceId || "",
+        resourceTitle: problem.resourceTitle || problem.title,
+      },
+      { method: "POST" }
+    );
+  };
+
+  const isScanning = actionFetcher.state === "submitting" && actionFetcher.formData?.get("intent") === "rescan";
 
   return (
     <div className="sa-page sa-fade-in">
       {/* Header */}
       <div className="sa-page-header">
         <div>
-          <div className="sa-page-title">Store Dashboard</div>
-          <div className="sa-page-subtitle">Store analytics & catalog health overview at a glance</div>
+          <div className="sa-page-title">Store Diagnostics & Analytics Dashboard</div>
+          <div className="sa-page-subtitle">
+            Real-time store performance, catalog health, problem detection, and 1-click remediation
+          </div>
         </div>
         <div className="sa-inline">
           <div className="sa-date-pills">
@@ -564,148 +408,365 @@ export default function OverviewPage() {
               </button>
             ))}
           </div>
+          <button
+            onClick={handleRunScan}
+            disabled={isScanning}
+            className="sa-btn sa-btn-primary"
+            style={{ fontSize: 12, padding: "5px 14px" }}
+          >
+            {isScanning ? "Scanning Catalog..." : "🔄 Run Diagnostics"}
+          </button>
         </div>
       </div>
 
-      {/* Metrics Row */}
+      {/* Action Notification Toast */}
+      {actionFetcher.data && (
+        <div
+          className="sa-card"
+          style={{
+            marginBottom: "var(--sa-space-5)",
+            padding: "12px 16px",
+            borderColor: actionFetcher.data.success ? "var(--sa-emerald)" : "var(--sa-rose)",
+            background: actionFetcher.data.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span>{actionFetcher.data.success ? "✅" : "⚠️"}</span>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>
+              {actionFetcher.data.message || actionFetcher.data.error}
+            </div>
+          </div>
+          <button
+            onClick={() => (actionFetcher.data = null)}
+            className="sa-btn sa-btn-ghost"
+            style={{ padding: "2px 8px", fontSize: 11 }}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* High-Priority Diagnostic Banner if Critical Problems Exist */}
+      {health.critical > 0 && (
+        <div
+          className="sa-card"
+          style={{
+            marginBottom: "var(--sa-space-6)",
+            borderColor: "rgba(244, 63, 94, 0.4)",
+            background: "linear-gradient(180deg, rgba(244, 63, 94, 0.08) 0%, var(--sa-surface) 100%)",
+            padding: "14px 18px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 22 }}>🚨</span>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 14, color: "var(--sa-rose)" }}>
+                  {health.critical} Critical Store {health.critical === 1 ? "Problem" : "Problems"} Requiring Attention
+                </div>
+                <div className="sa-text-muted" style={{ fontSize: 12 }}>
+                  Critical issues directly impact customer checkout or conversion (e.g. out-of-stock active products or pricing errors).
+                </div>
+              </div>
+            </div>
+            <a href="/app/problems" className="sa-btn sa-btn-danger" style={{ fontSize: 12, padding: "5px 12px" }}>
+              Review & Fix All →
+            </a>
+          </div>
+        </div>
+      )}
+
+      {/* Metrics Row with Comparative Growth */}
       <div className="sa-metrics-grid">
         <MetricCard
           label="Gross Revenue"
           value={fmtMoney(kpi.grossSales)}
+          delta={kpi.revenueGrowth}
           accent="var(--sa-emerald)"
           sparkData={revenueSparkData}
         />
         <MetricCard
-          label="Net Revenue"
+          label="Net Sales"
           value={fmtMoney(kpi.netSales)}
           accent="var(--sa-cyan)"
-          sparkData={revenueSparkData}
+          subtitle={
+            kpi.grossSales > 0
+              ? `${Math.round((kpi.netSales / kpi.grossSales) * 100)}% of gross`
+              : "Post discounts"
+          }
         />
         <MetricCard
           label="Orders"
           value={fmtNum(kpi.orders)}
+          delta={kpi.orderGrowth}
           accent="var(--sa-indigo)"
           sparkData={ordersSparkData}
         />
         <MetricCard
           label="Avg. Order Value"
           value={fmtMoney(kpi.aov)}
+          delta={kpi.aovGrowth}
           accent="var(--sa-amber)"
         />
         <MetricCard
-          label="New Customers"
-          value={fmtNum(customers.new)}
+          label="Units Sold"
+          value={fmtNum(kpi.unitsSold)}
+          delta={kpi.unitsGrowth}
           accent="var(--sa-violet)"
         />
         <MetricCard
-          label="Returning Customers"
-          value={fmtNum(customers.returning)}
+          label="Active SKUs"
+          value={fmtNum(catalogStats.total)}
           accent="var(--sa-orange)"
+          subtitle={
+            catalogStats.outOfStock > 0
+              ? `⚠️ ${catalogStats.outOfStock} out of stock`
+              : "All stock healthy"
+          }
         />
       </div>
 
-      {/* Content Grid */}
+      {/* Content Grid: Left (Analytics & Insights), Right (Health & Remediation) */}
       <div className="sa-content-grid">
-
-        {/* Left: Revenue Trend */}
+        {/* Left Stack */}
         <div className="sa-stack" style={{ gap: "var(--sa-space-5)" }}>
+          {/* Revenue & Order Velocity Chart */}
           <div className="sa-card">
             <div className="sa-card-header">
-              <div className="sa-card-title">Revenue Trend</div>
-              <span className="sa-badge neutral">{DATE_RANGES[activePeriod]?.label}</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <div className="sa-card-title">
+                  {chartView === "revenue" ? "Revenue Velocity" : "Order Volume Trend"}
+                </div>
+                {summary?.peakDay && (
+                  <span className="sa-badge success" style={{ textTransform: "none" }}>
+                    🏆 Peak: {fmtMoney(summary.peakDay.gross_sales)} ({summary.peakDay.day})
+                  </span>
+                )}
+                {summary?.avgDailySales > 0 && (
+                  <span className="sa-badge neutral" style={{ textTransform: "none" }}>
+                    Avg: {fmtMoney(summary.avgDailySales)}/day
+                  </span>
+                )}
+              </div>
+              <div className="sa-date-pills">
+                <button
+                  className={`sa-date-pill${chartView === "revenue" ? " active" : ""}`}
+                  onClick={() => setChartView("revenue")}
+                >
+                  Revenue
+                </button>
+                <button
+                  className={`sa-date-pill${chartView === "orders" ? " active" : ""}`}
+                  onClick={() => setChartView("orders")}
+                >
+                  Orders
+                </button>
+              </div>
             </div>
+
             <div className="sa-card-body">
               {trendRows.length > 0 ? (
-                <div style={{ width: "100%", height: 220 }}>
-                  <svg
-                    viewBox={`0 0 800 200`}
-                    preserveAspectRatio="none"
-                    style={{ width: "100%", height: "100%" }}
-                  >
-                    {(() => {
-                      const vals = trendRows.map((r) => parseFloat(r.gross_sales ?? 0));
-                      const maxV = Math.max(...vals, 1);
-                      const pts = vals.map((v, i) => {
-                        const x = (i / Math.max(vals.length - 1, 1)) * 780 + 10;
-                        const y = 190 - (v / maxV) * 170;
-                        return `${x},${y}`;
-                      }).join(" ");
-
-                      const areaBase = `10,190 ${pts} ${((vals.length - 1) / Math.max(vals.length - 1, 1)) * 780 + 10},190`;
-
-                      return (
-                        <>
-                          <defs>
-                            <linearGradient id="revGrad" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="0%" stopColor="#10b981" stopOpacity="0.25" />
-                              <stop offset="100%" stopColor="#10b981" stopOpacity="0" />
-                            </linearGradient>
-                          </defs>
-                          <polygon points={areaBase} fill="url(#revGrad)" />
-                          <polyline
-                            points={pts}
-                            fill="none"
-                            stroke="#10b981"
-                            strokeWidth="2.5"
-                            strokeLinejoin="round"
-                            strokeLinecap="round"
+                <div>
+                  <div style={{ width: "100%", height: 220, position: "relative" }}>
+                    <svg
+                      viewBox="0 0 800 200"
+                      preserveAspectRatio="none"
+                      style={{ width: "100%", height: "100%" }}
+                    >
+                      <defs>
+                        <linearGradient id="dashGrad" x1="0" y1="0" x2="0" y2="1">
+                          <stop
+                            offset="0%"
+                            stopColor={chartView === "revenue" ? "#10b981" : "#6366f1"}
+                            stopOpacity="0.3"
                           />
-                        </>
-                      );
-                    })()}
-                  </svg>
+                          <stop
+                            offset="100%"
+                            stopColor={chartView === "revenue" ? "#10b981" : "#6366f1"}
+                            stopOpacity="0"
+                          />
+                        </linearGradient>
+                      </defs>
+
+                      {(() => {
+                        const vals = trendRows.map((r) =>
+                          chartView === "revenue" ? r.gross_sales || 0 : r.orders || 0
+                        );
+                        const maxV = Math.max(...vals, 1);
+                        const pts = vals
+                          .map((v, i) => {
+                            const x = (i / Math.max(vals.length - 1, 1)) * 780 + 10;
+                            const y = 190 - (v / maxV) * 170;
+                            return `${x},${y}`;
+                          })
+                          .join(" ");
+
+                        const areaBase = `10,190 ${pts} ${
+                          ((vals.length - 1) / Math.max(vals.length - 1, 1)) * 780 + 10
+                        },190`;
+
+                        const strokeColor = chartView === "revenue" ? "#10b981" : "#6366f1";
+
+                        return (
+                          <>
+                            <polygon points={areaBase} fill="url(#dashGrad)" />
+                            <polyline
+                              points={pts}
+                              fill="none"
+                              stroke={strokeColor}
+                              strokeWidth="2.5"
+                              strokeLinejoin="round"
+                              strokeLinecap="round"
+                            />
+                            {trendRows.map((r, i) => {
+                              const val = chartView === "revenue" ? r.gross_sales || 0 : r.orders || 0;
+                              const cx = (i / Math.max(vals.length - 1, 1)) * 780 + 10;
+                              const cy = 190 - (val / maxV) * 170;
+                              return (
+                                <circle
+                                  key={r.day}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={trendRows.length > 25 ? 2 : 4}
+                                  fill={strokeColor}
+                                  stroke="var(--sa-surface)"
+                                  strokeWidth="1.5"
+                                />
+                              );
+                            })}
+                          </>
+                        );
+                      })()}
+                    </svg>
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      fontSize: 11,
+                      color: "var(--sa-text-dimmed)",
+                      marginTop: 6,
+                    }}
+                  >
+                    <span>{trendRows[0]?.day}</span>
+                    <span>{trendRows[trendRows.length - 1]?.day}</span>
+                  </div>
                 </div>
               ) : (
                 <div className="sa-empty">
                   <div className="sa-empty-icon">📊</div>
-                  <div className="sa-empty-title">No sales data yet</div>
+                  <div className="sa-empty-title">No transactions recorded</div>
                   <div className="sa-empty-body">
-                    Once your store has orders, your revenue trend will appear here.
+                    When sales activity takes place, your revenue curve and velocity trends will appear here.
                   </div>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Products + Customers summary row */}
+          {/* Catalog & Customer Health Summary */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--sa-space-4)" }}>
             <div className="sa-card">
               <div className="sa-card-header">
-                <div className="sa-card-title">Products</div>
-                <span className="sa-badge success">Active</span>
+                <div className="sa-card-title">Inventory Health</div>
+                <a href="/app/inventory" className="sa-btn sa-btn-ghost" style={{ padding: "2px 8px", fontSize: 11 }}>
+                  Manage →
+                </a>
               </div>
               <div className="sa-card-body">
-                <div className="sa-metric-value">{fmtNum(products.total)}</div>
-                <div className="sa-text-muted sa-text-small" style={{ marginTop: 6 }}>
-                  {fmtNum(products.active)} active scanned
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                  <span className="sa-text-muted" style={{ fontSize: 13 }}>In-Stock Active:</span>
+                  <strong style={{ color: "var(--sa-emerald)" }}>
+                    {fmtNum(catalogStats.total - catalogStats.outOfStock)}
+                  </strong>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Low Stock Alert:</span>
+                  <strong style={{ color: "var(--sa-amber)" }}>{fmtNum(catalogStats.lowStock)}</strong>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Out of Stock:</span>
+                  <strong style={{ color: catalogStats.outOfStock > 0 ? "var(--sa-rose)" : "inherit" }}>
+                    {fmtNum(catalogStats.outOfStock)}
+                  </strong>
                 </div>
               </div>
             </div>
 
             <div className="sa-card">
               <div className="sa-card-header">
-                <div className="sa-card-title">Customers</div>
-                {returningRate && <span className="sa-badge neutral">{returningRate}</span>}
+                <div className="sa-card-title">Customer Retention</div>
+                <span className="sa-badge neutral">{returningRate} Returning</span>
               </div>
               <div className="sa-card-body">
-                <div className="sa-metric-value">{fmtNum(totalCustomers)}</div>
-                <div className="sa-text-muted sa-text-small" style={{ marginTop: 6 }}>
-                  {fmtNum(customers.new)} new · {fmtNum(customers.returning)} returning
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Total Buyers:</span>
+                  <strong>{fmtNum(customers.total)}</strong>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                  <span className="sa-text-muted" style={{ fontSize: 13 }}>New Customers:</span>
+                  <strong style={{ color: "var(--sa-cyan)" }}>{fmtNum(customers.new)}</strong>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Repeat Buyers:</span>
+                  <strong style={{ color: "var(--sa-violet)" }}>{fmtNum(customers.returning)}</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Problem Categories Breakdown */}
+          <div className="sa-card">
+            <div className="sa-card-header">
+              <div className="sa-card-title">Diagnostic Categories</div>
+              <span className="sa-badge neutral">{health.total} Total Issues</span>
+            </div>
+            <div className="sa-card-body">
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, textAlign: "center" }}>
+                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-emerald)" }}>
+                    {health.categories.inventory}
+                  </div>
+                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>Inventory</div>
+                </div>
+                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-indigo)" }}>
+                    {health.categories.product}
+                  </div>
+                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>Product</div>
+                </div>
+                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-amber)" }}>
+                    {health.categories.seo}
+                  </div>
+                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>SEO</div>
+                </div>
+                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-violet)" }}>
+                    {health.categories.performance}
+                  </div>
+                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>Speed</div>
                 </div>
               </div>
             </div>
           </div>
         </div>
 
-        {/* Right: Health + Problems */}
-        <div className="sa-stack" style={{ gap: "var(--sa-space-4)" }}>
-
-          {/* Health Score Ring */}
+        {/* Right Stack: Health Score & Actionable Problems */}
+        <div className="sa-stack" style={{ gap: "var(--sa-space-5)" }}>
+          {/* Store Health Score Ring */}
           <div className="sa-card">
             <div className="sa-card-header">
-              <div className="sa-card-title">Store Health</div>
-              <span className={`sa-badge ${health.score >= 80 ? "success" : health.score >= 50 ? "warning" : "critical"}`}>
-                {health.score >= 80 ? "Good" : health.score >= 50 ? "Fair" : "Needs Attention"}
+              <div className="sa-card-title">Store Diagnostic Health</div>
+              <span
+                className={`sa-badge ${
+                  health.score >= 80 ? "success" : health.score >= 50 ? "warning" : "critical"
+                }`}
+              >
+                {health.score >= 80 ? "Good" : health.score >= 50 ? "Needs Attention" : "Critical"}
               </span>
             </div>
             <HealthRing score={health.score} />
@@ -713,42 +774,114 @@ export default function OverviewPage() {
             <div className="sa-card-body" style={{ paddingTop: "var(--sa-space-3)" }}>
               <div style={{ display: "flex", gap: "var(--sa-space-4)", justifyContent: "center" }}>
                 <div style={{ textAlign: "center" }}>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-rose)" }}>{health.critical}</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-rose)" }}>
+                    {health.critical}
+                  </div>
                   <div className="sa-text-muted sa-text-small">Critical</div>
                 </div>
                 <div style={{ textAlign: "center" }}>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-amber)" }}>{health.warning}</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-amber)" }}>
+                    {health.warning}
+                  </div>
                   <div className="sa-text-muted sa-text-small">Warnings</div>
                 </div>
                 <div style={{ textAlign: "center" }}>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-violet)" }}>{health.notice}</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-violet)" }}>
+                    {health.notice}
+                  </div>
                   <div className="sa-text-muted sa-text-small">Notices</div>
+                </div>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-emerald)" }}>
+                    {health.resolved}
+                  </div>
+                  <div className="sa-text-muted sa-text-small">Resolved</div>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Top Problems */}
+          {/* Top Actionable Problems */}
           <div className="sa-card">
             <div className="sa-card-header">
-              <div className="sa-card-title">Top Problems</div>
+              <div className="sa-card-title">Top Priority Issues</div>
               <a href="/app/problems" className="sa-btn sa-btn-ghost" style={{ padding: "4px 10px", fontSize: 12 }}>
-                View all →
+                View all ({health.total}) →
               </a>
             </div>
             <div className="sa-card-body no-pad">
-              {problems.length > 0 ? (
-                problems.map((p) => <ProblemItem key={p.id} problem={p} />)
+              {topProblems.length > 0 ? (
+                topProblems.map((prob) => {
+                  const severityClass =
+                    prob.severity === "CRITICAL"
+                      ? "critical"
+                      : prob.severity === "WARNING"
+                      ? "warning"
+                      : "notice";
+                  const fixClass = prob.fixType === "APP_FIX" ? "app-fix" : "dev-fix";
+                  const isAppFix = prob.fixType === "APP_FIX";
+
+                  return (
+                    <div key={prob.id} className="sa-problem-card">
+                      <div className="sa-problem-card-header">
+                        <div className="sa-problem-title">{prob.title}</div>
+                        <div className="sa-problem-badges">
+                          <span className={`sa-badge ${severityClass}`}>{prob.severity}</span>
+                          <span className={`sa-badge ${fixClass}`}>
+                            {isAppFix ? "1-Click Fix" : "Dev Fix"}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="sa-problem-desc">{prob.description}</div>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          marginTop: 6,
+                        }}
+                      >
+                        <div style={{ fontSize: 11, color: "var(--sa-text-dimmed)" }}>
+                          {prob.resourceType || "Product"} · {prob.category}
+                        </div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          {isAppFix && (
+                            <button
+                              onClick={() => handleQuickFix(prob)}
+                              disabled={actionFetcher.state === "submitting"}
+                              className="sa-btn sa-btn-primary"
+                              style={{ padding: "3px 9px", fontSize: 11 }}
+                            >
+                              ⚡ Quick Fix
+                            </button>
+                          )}
+                          {prob.resourceUrl && (
+                            <a
+                              href={prob.resourceUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="sa-btn sa-btn-ghost"
+                              style={{ padding: "3px 9px", fontSize: 11 }}
+                            >
+                              Shopify ↗
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
               ) : (
                 <div className="sa-empty" style={{ padding: "var(--sa-space-8)" }}>
                   <div className="sa-empty-icon">✅</div>
-                  <div className="sa-empty-title">No critical issues</div>
-                  <div className="sa-empty-body">Your store looks healthy! Run a full scan to check for warnings.</div>
+                  <div className="sa-empty-title">All systems healthy</div>
+                  <div className="sa-empty-body">
+                    No open problems detected. Run diagnostics anytime to verify catalog and storefront health.
+                  </div>
                 </div>
               )}
             </div>
           </div>
-
         </div>
       </div>
     </div>
@@ -759,9 +892,19 @@ export function ErrorBoundary() {
   const error = useRouteError();
   return (
     <div className="sa-page sa-fade-in">
-      <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
+      <div
+        className="sa-card"
+        style={{
+          padding: "var(--sa-space-6)",
+          maxWidth: 640,
+          margin: "40px auto",
+          textAlign: "center",
+        }}
+      >
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
-        <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load store data</div>
+        <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>
+          Unable to load dashboard
+        </div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
           {error?.message || "An unexpected error occurred while fetching analytics."}
         </div>

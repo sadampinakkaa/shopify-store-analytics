@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "10a15bbf29516134621c8aa9332c7b2a"
-application_url = "https://example.com"
+application_url = "https://analytics.pinakkaa.com"
 embedded = true
 name = "store analytics"
 
@@ -22,7 +22,7 @@ api_version = "2026-10"
   topics = [ "app/scopes_update" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://analytics.pinakkaa.com/api/auth" ]
 
 [build]
 include_config_on_deploy = true

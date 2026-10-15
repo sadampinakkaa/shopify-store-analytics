@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { useLoaderData, useRevalidator, useRouteError } from "react-router";
+import { useLoaderData, useFetcher, useSearchParams, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
@@ -7,6 +7,7 @@ import {
   fetchStoreOrders,
   computeSalesAnalytics,
 } from "../services/analytics.server";
+import { syncStoreSalesHistory } from "../services/sync.server";
 
 const DATE_RANGES = [
   { label: "7D", sinceExpr: "-7d" },
@@ -53,6 +54,36 @@ export const loader = async ({ request }) => {
   };
 };
 
+export const action = async ({ request }) => {
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "sync_sales") {
+    try {
+      const days = parseInt(formData.get("days") || "30", 10);
+      const result = await syncStoreSalesHistory(admin, session.shop, days);
+      return {
+        success: true,
+        message: `Synced ${result.ordersSynced} orders across ${result.daysSynced} days into database snapshot.`,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Failed to sync sales data." };
+    }
+  }
+
+  if (intent === "dismiss_anomaly") {
+    const anomalyId = formData.get("anomalyId");
+    return {
+      success: true,
+      message: `Anomaly ${anomalyId} acknowledged.`,
+      dismissedId: anomalyId,
+    };
+  }
+
+  return { success: false, error: "Invalid action intent" };
+};
+
 export default function SalesPage() {
   const {
     shop,
@@ -62,32 +93,56 @@ export default function SalesPage() {
     prevPeriod,
     trendRows,
     dayOfWeekBreakdown,
+    recentOrders = [],
     summary,
-    anomalies,
+    anomalies: initialAnomalies = [],
   } = useLoaderData();
-  const revalidator = useRevalidator();
 
-  const [activePeriod, setActivePeriod] = useState(
-    DATE_RANGES.findIndex((r) => r.sinceExpr === since) !== -1
-      ? DATE_RANGES.findIndex((r) => r.sinceExpr === since)
-      : 1
-  );
+  const [searchParams, setSearchParams] = useSearchParams();
+  const syncFetcher = useFetcher();
+  const dismissFetcher = useFetcher();
+
+  const [dismissedAnomalies, setDismissedAnomalies] = useState([]);
+  const anomalies = initialAnomalies.filter((a) => !dismissedAnomalies.includes(a.id));
+
+  const activePeriod = DATE_RANGES.findIndex((r) => r.sinceExpr === since) !== -1
+    ? DATE_RANGES.findIndex((r) => r.sinceExpr === since)
+    : 1;
 
   // Chart Metric Mode: "gross_sales" | "orders" | "units" | "aov"
   const [chartMetric, setChartMetric] = useState("gross_sales");
 
-  // Table filters & sorting
+  // Tab View for Data Exploration: "daily" | "orders"
+  const [dataTab, setDataTab] = useState("daily");
+
+  // Daily Table filters & sorting
   const [tableSearch, setTableSearch] = useState("");
   const [sortField, setSortField] = useState("day");
   const [sortDir, setSortDir] = useState("desc"); // 'asc' | 'desc'
 
+  // Orders Drilldown filters & sorting
+  const [orderSearch, setOrderSearch] = useState("");
+  const [financialFilter, setFinancialFilter] = useState("ALL");
+
   const handlePeriodChange = (idx) => {
-    setActivePeriod(idx);
     const { sinceExpr } = DATE_RANGES[idx];
-    const url = new URL(window.location.href);
-    url.searchParams.set("since", sinceExpr);
-    window.history.pushState({}, "", url);
-    revalidator.revalidate();
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set("since", sinceExpr);
+      return next;
+    });
+  };
+
+  const handleSyncData = () => {
+    syncFetcher.submit(
+      { intent: "sync_sales", days: String(periodDates.days || 30) },
+      { method: "POST" }
+    );
+  };
+
+  const handleDismissAnomaly = (id) => {
+    setDismissedAnomalies((prev) => [...prev, id]);
+    dismissFetcher.submit({ intent: "dismiss_anomaly", anomalyId: id }, { method: "POST" });
   };
 
   // Filter and sort daily trend rows
@@ -109,6 +164,23 @@ export default function SalesPage() {
     });
     return result;
   }, [trendRows, tableSearch, sortField, sortDir]);
+
+  // Filter recent orders
+  const filteredOrders = useMemo(() => {
+    let list = [...recentOrders];
+    if (orderSearch.trim()) {
+      const q = orderSearch.toLowerCase().trim();
+      list = list.filter(
+        (o) =>
+          o.name.toLowerCase().includes(q) ||
+          (o.customerName && o.customerName.toLowerCase().includes(q))
+      );
+    }
+    if (financialFilter !== "ALL") {
+      list = list.filter((o) => (o.financialStatus || "").toUpperCase() === financialFilter);
+    }
+    return list;
+  }, [recentOrders, orderSearch, financialFilter]);
 
   const toggleSort = (field) => {
     if (sortField === field) {
@@ -147,24 +219,27 @@ export default function SalesPage() {
   const chartValues = trendRows.map((r) => r[chartMetric] || 0);
   const maxChartVal = Math.max(...chartValues, 1);
   const metricLabels = {
-    gross_sales: { label: "Gross Sales", prefix: "$", color: "#10b981", gradId: "salesGrad" },
-    orders: { label: "Orders", prefix: "", color: "#6366f1", gradId: "ordersGrad" },
-    units: { label: "Units Sold", prefix: "", color: "#8b5cf6", gradId: "unitsGrad" },
-    aov: { label: "Average Order Value", prefix: "$", color: "#f59e0b", gradId: "aovGrad" },
+    gross_sales: { label: "Gross Sales", prefix: "$", color: "var(--sa-emerald)", gradId: "salesGrad" },
+    net_sales: { label: "Net Sales", prefix: "$", color: "var(--sa-teal)", gradId: "netGrad" },
+    orders: { label: "Orders", prefix: "", color: "var(--sa-indigo)", gradId: "ordGrad" },
+    units: { label: "Units Sold", prefix: "", color: "var(--sa-purple)", gradId: "unitGrad" },
+    aov: { label: "Avg Order Value", prefix: "$", color: "var(--sa-amber)", gradId: "aovGrad" },
   };
-  const activeMetricCfg = metricLabels[chartMetric];
 
-  // Highest day of week
-  const maxDowSales = Math.max(...(dayOfWeekBreakdown?.map((d) => d.gross_sales) || [1]), 1);
+  const activeMetricCfg = metricLabels[chartMetric] || metricLabels.gross_sales;
+  const isSyncing = syncFetcher.state === "submitting";
+
+  const dowSales = dayOfWeekBreakdown?.map((d) => d.gross_sales) || [];
+  const maxDowSales = Math.max(...dowSales, 1);
 
   return (
     <div className="sa-page sa-fade-in">
-      {/* Header */}
+      {/* Page Header */}
       <div className="sa-page-header">
         <div>
-          <div className="sa-page-title">Sales Analytics & Anomaly Detection</div>
+          <div className="sa-page-title">Sales Analytics & Order Intelligence</div>
           <div className="sa-page-subtitle">
-            Revenue velocity, order volume, period-over-period growth, and sales drop diagnostics
+            Track gross & net revenues, average order value, order velocity, and daily growth drivers
           </div>
         </div>
         <div className="sa-inline">
@@ -180,137 +255,74 @@ export default function SalesPage() {
             ))}
           </div>
           <button
+            onClick={handleSyncData}
+            disabled={isSyncing}
+            className="sa-btn sa-btn-secondary"
+            style={{ fontSize: 12, padding: "5px 12px" }}
+            title="Sync latest orders and update database snapshots"
+          >
+            {isSyncing ? "⚡ Syncing..." : "⚡ Sync Data"}
+          </button>
+          <button
             onClick={handleExportCSV}
             className="sa-btn sa-btn-secondary"
             style={{ fontSize: 12, padding: "5px 12px" }}
-            title="Export daily sales data as CSV"
+            title="Download CSV report"
           >
             📥 Export CSV
           </button>
         </div>
       </div>
 
-      {/* Sales Problem & Anomaly Detection Banner */}
-      {anomalies && anomalies.length > 0 ? (
+      {/* Action Notification Toast */}
+      {syncFetcher.data && (
         <div
           className="sa-card"
           style={{
-            marginBottom: "var(--sa-space-6)",
-            borderColor: "rgba(245, 158, 11, 0.4)",
-            background: "linear-gradient(180deg, rgba(245, 158, 11, 0.08) 0%, var(--sa-surface) 100%)",
-          }}
-        >
-          <div className="sa-card-header">
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontSize: 18 }}>⚠️</span>
-              <div className="sa-card-title" style={{ color: "var(--sa-amber)" }}>
-                Sales Diagnostic Alerts ({anomalies.length} detected)
-              </div>
-            </div>
-            <span className="sa-badge warning">Action Recommended</span>
-          </div>
-          <div className="sa-card-body" style={{ padding: "var(--sa-space-4) var(--sa-space-5)" }}>
-            <div style={{ display: "grid", gap: "var(--sa-space-3)" }}>
-              {anomalies.map((ano) => (
-                <div
-                  key={ano.id}
-                  style={{
-                    display: "flex",
-                    alignItems: "flex-start",
-                    justifyContent: "space-between",
-                    padding: "10px 14px",
-                    background: "var(--sa-surface-2)",
-                    borderRadius: "var(--sa-radius-sm)",
-                    borderLeft: `4px solid ${
-                      ano.severity === "CRITICAL"
-                        ? "var(--sa-rose)"
-                        : ano.severity === "WARNING"
-                        ? "var(--sa-amber)"
-                        : "var(--sa-cyan)"
-                    }`,
-                  }}
-                >
-                  <div>
-                    <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 2 }}>{ano.title}</div>
-                    <div className="sa-text-muted" style={{ fontSize: 12, lineHeight: 1.4 }}>
-                      {ano.description}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: 11,
-                        color: "var(--sa-text-dimmed)",
-                        marginTop: 4,
-                        fontStyle: "italic",
-                      }}
-                    >
-                      Impact: {ano.whyItMatters}
-                    </div>
-                  </div>
-                  <span
-                    className={`sa-badge ${
-                      ano.severity === "CRITICAL"
-                        ? "critical"
-                        : ano.severity === "WARNING"
-                        ? "warning"
-                        : "notice"
-                    }`}
-                  >
-                    {ano.type}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div
-          className="sa-card"
-          style={{
-            marginBottom: "var(--sa-space-6)",
-            padding: "12px 18px",
-            background: "rgba(16, 185, 129, 0.05)",
-            border: "1px solid rgba(16, 185, 129, 0.2)",
+            marginBottom: "var(--sa-space-5)",
+            padding: "12px 16px",
+            borderColor: syncFetcher.data.success ? "var(--sa-emerald)" : "var(--sa-rose)",
+            background: syncFetcher.data.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <span style={{ fontSize: 18 }}>✅</span>
-            <div>
-              <div style={{ fontWeight: 600, fontSize: 13, color: "var(--sa-emerald)" }}>
-                Sales Health Stable
-              </div>
-              <div className="sa-text-muted" style={{ fontSize: 12 }}>
-                No significant sales dips, zero-order anomalies, or margin leakage detected in this period.
-              </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span>{syncFetcher.data.success ? "✅" : "⚠️"}</span>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>
+              {syncFetcher.data.message || syncFetcher.data.error}
             </div>
           </div>
-          <span className="sa-badge success">Healthy</span>
+          <button
+            onClick={() => (syncFetcher.data = null)}
+            className="sa-btn sa-btn-ghost"
+            style={{ padding: "2px 8px", fontSize: 11 }}
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
-      {/* KPI Cards Grid */}
+      {/* KPI Cards Row */}
       <div className="sa-metrics-grid">
         <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-emerald)" }}>
-          <div className="sa-metric-label">Gross Revenue</div>
+          <div className="sa-metric-label">Gross Sales</div>
           <div className="sa-metric-value">{fmtMoney(kpi.grossSales)}</div>
           {kpi.revenueGrowth != null ? (
             <span className={`sa-metric-delta ${kpi.revenueGrowth >= 0 ? "up" : "down"}`}>
-              {kpi.revenueGrowth >= 0 ? "↑" : "↓"} {Math.abs(kpi.revenueGrowth)}% vs prev period
+              {kpi.revenueGrowth >= 0 ? "↑" : "↓"} {fmtPct(kpi.revenueGrowth)} vs prev
             </span>
           ) : (
             <span className="sa-metric-delta neutral">Period baseline</span>
           )}
         </div>
 
-        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-cyan)" }}>
+        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-teal)" }}>
           <div className="sa-metric-label">Net Sales</div>
           <div className="sa-metric-value">{fmtMoney(kpi.netSales)}</div>
           <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
-            {kpi.grossSales > 0
-              ? `${Math.round((kpi.netSales / kpi.grossSales) * 100)}% of gross revenue`
-              : "Post discounts & returns"}
+            Discounts/returns: {fmtMoney(kpi.grossSales - kpi.netSales)}
           </div>
         </div>
 
@@ -319,181 +331,196 @@ export default function SalesPage() {
           <div className="sa-metric-value">{fmtNum(kpi.orders)}</div>
           {kpi.orderGrowth != null ? (
             <span className={`sa-metric-delta ${kpi.orderGrowth >= 0 ? "up" : "down"}`}>
-              {kpi.orderGrowth >= 0 ? "↑" : "↓"} {Math.abs(kpi.orderGrowth)}% vs prev period
+              {kpi.orderGrowth >= 0 ? "↑" : "↓"} {fmtPct(kpi.orderGrowth)} vs prev
             </span>
           ) : (
             <span className="sa-metric-delta neutral">Period baseline</span>
           )}
         </div>
 
-        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-violet)" }}>
+        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-purple)" }}>
           <div className="sa-metric-label">Units Sold</div>
           <div className="sa-metric-value">{fmtNum(kpi.unitsSold)}</div>
-          {kpi.unitsGrowth != null && (
-            <span className={`sa-metric-delta ${kpi.unitsGrowth >= 0 ? "up" : "down"}`}>
-              {kpi.unitsGrowth >= 0 ? "↑" : "↓"} {Math.abs(kpi.unitsGrowth)}%
-            </span>
-          )}
+          <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+            Avg {kpi.itemsPerOrder} items / order
+          </div>
         </div>
 
         <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-amber)" }}>
           <div className="sa-metric-label">Average Order Value</div>
           <div className="sa-metric-value">{fmtMoney(kpi.aov)}</div>
-          {kpi.aovGrowth != null && (
+          {kpi.aovGrowth != null ? (
             <span className={`sa-metric-delta ${kpi.aovGrowth >= 0 ? "up" : "down"}`}>
-              {kpi.aovGrowth >= 0 ? "↑" : "↓"} {Math.abs(kpi.aovGrowth)}%
+              {kpi.aovGrowth >= 0 ? "↑" : "↓"} {fmtPct(kpi.aovGrowth)} vs prev
             </span>
+          ) : (
+            <span className="sa-metric-delta neutral">Period baseline</span>
           )}
-        </div>
-
-        <div className="sa-metric-card" style={{ "--sa-accent": "var(--sa-orange)" }}>
-          <div className="sa-metric-label">Items Per Order</div>
-          <div className="sa-metric-value">{kpi.itemsPerOrder || 0}</div>
-          <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
-            Basket depth efficiency
-          </div>
         </div>
       </div>
 
-      {/* Interactive Sales Trend Chart Card */}
-      <div className="sa-card" style={{ marginTop: "var(--sa-space-6)" }}>
-        <div className="sa-card-header">
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <div className="sa-card-title">Daily Sales Velocity</div>
-            {summary.peakDay && (
-              <span className="sa-badge success" style={{ textTransform: "none" }}>
-                🏆 Peak: {fmtMoney(summary.peakDay.gross_sales)} ({summary.peakDay.day})
-              </span>
-            )}
-            {summary.avgDailySales > 0 && (
-              <span className="sa-badge neutral" style={{ textTransform: "none" }}>
-                Avg: {fmtMoney(summary.avgDailySales)} / day
-              </span>
-            )}
-          </div>
+      {/* Detected Sales Anomalies Banner */}
+      {anomalies.length > 0 && (
+        <div style={{ marginBottom: "var(--sa-space-6)" }}>
+          {anomalies.map((anom) => (
+            <div
+              key={anom.id}
+              className="sa-card"
+              style={{
+                marginBottom: "var(--sa-space-3)",
+                padding: "14px 18px",
+                borderLeft: "4px solid var(--sa-amber)",
+                background: "rgba(245, 158, 11, 0.04)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 16,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                <span style={{ fontSize: 20 }}>⚠️</span>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 14, color: "var(--sa-amber)" }}>
+                    {anom.title}
+                  </div>
+                  <div style={{ fontSize: 13, marginTop: 2, color: "var(--sa-text)" }}>
+                    {anom.description}
+                  </div>
+                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>
+                    {anom.whyItMatters}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => handleDismissAnomaly(anom.id)}
+                className="sa-btn sa-btn-secondary"
+                style={{ fontSize: 11, padding: "4px 10px", whiteSpace: "nowrap" }}
+              >
+                Acknowledge
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
-          {/* Metric Selector Pills */}
-          <div className="sa-date-pills">
-            <button
-              className={`sa-date-pill${chartMetric === "gross_sales" ? " active" : ""}`}
-              onClick={() => setChartMetric("gross_sales")}
-            >
-              Revenue ($)
-            </button>
-            <button
-              className={`sa-date-pill${chartMetric === "orders" ? " active" : ""}`}
-              onClick={() => setChartMetric("orders")}
-            >
-              Orders
-            </button>
-            <button
-              className={`sa-date-pill${chartMetric === "units" ? " active" : ""}`}
-              onClick={() => setChartMetric("units")}
-            >
-              Units
-            </button>
-            <button
-              className={`sa-date-pill${chartMetric === "aov" ? " active" : ""}`}
-              onClick={() => setChartMetric("aov")}
-            >
-              AOV ($)
-            </button>
+      {/* Main Interactive Chart Card */}
+      <div className="sa-card">
+        <div className="sa-card-header">
+          <div>
+            <div className="sa-card-title">Sales Trajectory & Order Dynamics</div>
+            <div className="sa-text-muted sa-text-small">
+              Daily trend analysis across the selected {periodDates.days}-day window
+            </div>
+          </div>
+          <div className="sa-tabs" style={{ marginBottom: 0 }}>
+            {Object.keys(metricLabels).map((k) => (
+              <button
+                key={k}
+                className={`sa-tab${chartMetric === k ? " active" : ""}`}
+                onClick={() => setChartMetric(k)}
+                style={{ fontSize: 12, padding: "4px 12px" }}
+              >
+                {metricLabels[k].label}
+              </button>
+            ))}
           </div>
         </div>
 
         <div className="sa-card-body">
-          {trendRows.length > 0 ? (
-            <div>
-              <div style={{ width: "100%", height: 260, position: "relative" }}>
-                <svg
-                  viewBox="0 0 800 240"
-                  preserveAspectRatio="none"
-                  style={{ width: "100%", height: "100%" }}
-                >
-                  <defs>
-                    <linearGradient id={activeMetricCfg.gradId} x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor={activeMetricCfg.color} stopOpacity="0.35" />
-                      <stop offset="100%" stopColor={activeMetricCfg.color} stopOpacity="0.0" />
-                    </linearGradient>
-                  </defs>
+          {trendRows.length > 1 ? (
+            <div style={{ width: "100%", height: 260, position: "relative" }}>
+              <svg width="100%" height="100%" viewBox="0 0 800 240" preserveAspectRatio="none">
+                <defs>
+                  <linearGradient id={activeMetricCfg.gradId} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={activeMetricCfg.color} stopOpacity="0.3" />
+                    <stop offset="100%" stopColor={activeMetricCfg.color} stopOpacity="0.0" />
+                  </linearGradient>
+                </defs>
 
-                  {/* Horizontal grid guide lines */}
-                  <line x1="20" y1="30" x2="780" y2="30" stroke="var(--sa-border-subtle)" strokeDasharray="4 4" />
-                  <line x1="20" y1="125" x2="780" y2="125" stroke="var(--sa-border-subtle)" strokeDasharray="4 4" />
-                  <line x1="20" y1="220" x2="780" y2="220" stroke="var(--sa-border-subtle)" />
+                {/* Horizontal reference grid lines */}
+                {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
+                  <line
+                    key={ratio}
+                    x1="40"
+                    y1={210 * (1 - ratio) + 10}
+                    x2="780"
+                    y2={210 * (1 - ratio) + 10}
+                    stroke="var(--sa-border-subtle)"
+                    strokeDasharray="4 4"
+                    strokeWidth="1"
+                  />
+                ))}
 
-                  {(() => {
-                    const pts = trendRows
-                      .map((r, i) => {
-                        const val = r[chartMetric] || 0;
-                        const x = (i / Math.max(trendRows.length - 1, 1)) * 760 + 20;
-                        const y = 220 - (val / maxChartVal) * 190;
-                        return `${x},${y}`;
-                      })
-                      .join(" ");
+                {/* Area Gradient Fill */}
+                <polygon
+                  points={`40,220 ${trendRows
+                    .map((r, i) => {
+                      const x = 40 + (i / Math.max(trendRows.length - 1, 1)) * 740;
+                      const y = 220 - ((r[chartMetric] || 0) / maxChartVal) * 200;
+                      return `${x},${y}`;
+                    })
+                    .join(" ")} 780,220`}
+                  fill={`url(#${activeMetricCfg.gradId})`}
+                />
 
-                    const areaBase = `20,220 ${pts} ${
-                      ((trendRows.length - 1) / Math.max(trendRows.length - 1, 1)) * 760 + 20
-                    },220`;
+                {/* Main Curve Line */}
+                <polyline
+                  points={trendRows
+                    .map((r, i) => {
+                      const x = 40 + (i / Math.max(trendRows.length - 1, 1)) * 740;
+                      const y = 220 - ((r[chartMetric] || 0) / maxChartVal) * 200;
+                      return `${x},${y}`;
+                    })
+                    .join(" ")}
+                  fill="none"
+                  stroke={activeMetricCfg.color}
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
 
-                    return (
-                      <>
-                        <polygon points={areaBase} fill={`url(#${activeMetricCfg.gradId})`} />
-                        <polyline
-                          points={pts}
-                          fill="none"
-                          stroke={activeMetricCfg.color}
-                          strokeWidth="2.5"
-                          strokeLinejoin="round"
-                          strokeLinecap="round"
-                        />
-                        {/* Point circles */}
-                        {trendRows.map((r, i) => {
-                          const val = r[chartMetric] || 0;
-                          const cx = (i / Math.max(trendRows.length - 1, 1)) * 760 + 20;
-                          const cy = 220 - (val / maxChartVal) * 190;
-                          return (
-                            <circle
-                              key={r.day}
-                              cx={cx}
-                              cy={cy}
-                              r={trendRows.length > 30 ? 2 : 4}
-                              fill={activeMetricCfg.color}
-                              stroke="var(--sa-surface)"
-                              strokeWidth="1.5"
-                            />
-                          );
-                        })}
-                      </>
-                    );
-                  })()}
-                </svg>
-              </div>
+                {/* Interactive Data Point Dots */}
+                {trendRows.map((r, i) => {
+                  const x = 40 + (i / Math.max(trendRows.length - 1, 1)) * 740;
+                  const y = 220 - ((r[chartMetric] || 0) / maxChartVal) * 200;
+                  return (
+                    <circle
+                      key={r.day}
+                      cx={x}
+                      cy={y}
+                      r="4"
+                      fill="var(--sa-surface-1)"
+                      stroke={activeMetricCfg.color}
+                      strokeWidth="2"
+                    >
+                      <title>{`${r.day}: ${activeMetricCfg.prefix}${r[chartMetric]}`}</title>
+                    </circle>
+                  );
+                })}
+              </svg>
 
-              {/* X Axis Labels */}
+              {/* X-axis date endpoints */}
               <div
                 style={{
                   display: "flex",
                   justifyContent: "space-between",
-                  fontSize: 11,
-                  color: "var(--sa-text-dimmed)",
+                  padding: "0 40px",
                   marginTop: 6,
-                  padding: "0 10px",
+                  fontSize: 11,
+                  color: "var(--sa-text-muted)",
                 }}
               >
                 <span>{trendRows[0]?.day}</span>
-                {trendRows.length > 2 && (
-                  <span>{trendRows[Math.floor(trendRows.length / 2)]?.day}</span>
-                )}
+                <span>{trendRows[Math.floor(trendRows.length / 2)]?.day}</span>
                 <span>{trendRows[trendRows.length - 1]?.day}</span>
               </div>
             </div>
           ) : (
-            <div className="sa-empty">
+            <div className="sa-empty" style={{ padding: "var(--sa-space-8)" }}>
               <div className="sa-empty-icon">📊</div>
-              <div className="sa-empty-title">No orders recorded in this timeframe</div>
+              <div className="sa-empty-title">Insufficient Sales Points</div>
               <div className="sa-empty-body">
-                When new transactions occur, your daily sales curve and performance breakdown will populate here.
+                Expand your date filter or sync orders to view trajectory trends.
               </div>
             </div>
           )}
@@ -528,11 +555,33 @@ export default function SalesPage() {
                 const barWidth = maxDowSales > 0 ? (dow.gross_sales / maxDowSales) * 100 : 0;
                 const isBest = dow.dayName === summary.bestDayName;
                 return (
-                  <div key={dow.dayName} style={{ display: "grid", gridTemplateColumns: "70px 1fr 90px", alignItems: "center", gap: 12 }}>
-                    <div style={{ fontSize: 12, fontWeight: isBest ? 700 : 500, color: isBest ? "var(--sa-emerald)" : "var(--sa-text)" }}>
+                  <div
+                    key={dow.dayName}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "70px 1fr 110px",
+                      alignItems: "center",
+                      gap: 12,
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 12,
+                        fontWeight: isBest ? 700 : 500,
+                        color: isBest ? "var(--sa-emerald)" : "var(--sa-text)",
+                      }}
+                    >
                       {dow.dayName.slice(0, 3)}
                     </div>
-                    <div style={{ background: "var(--sa-surface-3)", borderRadius: 4, height: 16, overflow: "hidden", position: "relative" }}>
+                    <div
+                      style={{
+                        background: "var(--sa-surface-3)",
+                        borderRadius: 4,
+                        height: 16,
+                        overflow: "hidden",
+                        position: "relative",
+                      }}
+                    >
                       <div
                         style={{
                           width: `${Math.max(barWidth, 3)}%`,
@@ -658,14 +707,27 @@ export default function SalesPage() {
         </div>
       </div>
 
-      {/* Daily Breakdown Table with Live Search & Sort */}
+      {/* Exploration View Switcher: Daily Trend vs Order Drill-down */}
       <div className="sa-card" style={{ marginTop: "var(--sa-space-6)" }}>
         <div className="sa-card-header">
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <div className="sa-card-title">Daily Sales Breakdown</div>
-            <span className="sa-badge success">{filteredRows.length} active day(s)</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <div className="sa-tabs" style={{ marginBottom: 0 }}>
+              <button
+                className={`sa-tab${dataTab === "daily" ? " active" : ""}`}
+                onClick={() => setDataTab("daily")}
+              >
+                📅 Daily Breakdown ({filteredRows.length})
+              </button>
+              <button
+                className={`sa-tab${dataTab === "orders" ? " active" : ""}`}
+                onClick={() => setDataTab("orders")}
+              >
+                🛍️ Recent Orders Drill-down ({filteredOrders.length})
+              </button>
+            </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+
+          {dataTab === "daily" ? (
             <input
               type="text"
               placeholder="Search by date (YYYY-MM-DD)..."
@@ -682,72 +744,179 @@ export default function SalesPage() {
                 width: 200,
               }}
             />
-          </div>
-        </div>
-        <div className="sa-card-body no-pad">
-          {filteredRows.length > 0 ? (
-            <table className="sa-table">
-              <thead>
-                <tr>
-                  <th
-                    style={{ cursor: "pointer", userSelect: "none" }}
-                    onClick={() => toggleSort("day")}
-                  >
-                    Date {sortField === "day" ? (sortDir === "asc" ? "↑" : "↓") : ""}
-                  </th>
-                  <th
-                    style={{ cursor: "pointer", userSelect: "none" }}
-                    onClick={() => toggleSort("gross_sales")}
-                  >
-                    Gross Sales {sortField === "gross_sales" ? (sortDir === "asc" ? "↑" : "↓") : ""}
-                  </th>
-                  <th
-                    style={{ cursor: "pointer", userSelect: "none" }}
-                    onClick={() => toggleSort("net_sales")}
-                  >
-                    Net Sales {sortField === "net_sales" ? (sortDir === "asc" ? "↑" : "↓") : ""}
-                  </th>
-                  <th
-                    style={{ cursor: "pointer", userSelect: "none" }}
-                    onClick={() => toggleSort("orders")}
-                  >
-                    Orders {sortField === "orders" ? (sortDir === "asc" ? "↑" : "↓") : ""}
-                  </th>
-                  <th
-                    style={{ cursor: "pointer", userSelect: "none" }}
-                    onClick={() => toggleSort("units")}
-                  >
-                    Units {sortField === "units" ? (sortDir === "asc" ? "↑" : "↓") : ""}
-                  </th>
-                  <th
-                    style={{ cursor: "pointer", userSelect: "none" }}
-                    onClick={() => toggleSort("aov")}
-                  >
-                    AOV {sortField === "aov" ? (sortDir === "asc" ? "↑" : "↓") : ""}
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredRows.map((row) => (
-                  <tr key={row.day}>
-                    <td style={{ fontWeight: 600 }}>{row.day}</td>
-                    <td style={{ fontWeight: 600, color: "var(--sa-emerald)" }}>
-                      {fmtMoney(row.gross_sales)}
-                    </td>
-                    <td>{fmtMoney(row.net_sales)}</td>
-                    <td>{fmtNum(row.orders)}</td>
-                    <td>{fmtNum(row.units)}</td>
-                    <td className="muted">{fmtMoney(row.aov)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
           ) : (
-            <div className="sa-empty" style={{ padding: "var(--sa-space-8)" }}>
-              <div className="sa-empty-icon">🔍</div>
-              <div className="sa-empty-title">No matching dates found</div>
-              <div className="sa-empty-body">Try clearing your search query.</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <select
+                value={financialFilter}
+                onChange={(e) => setFinancialFilter(e.target.value)}
+                style={{
+                  background: "var(--sa-surface-2)",
+                  border: "1px solid var(--sa-border-subtle)",
+                  borderRadius: "var(--sa-radius-sm)",
+                  color: "var(--sa-text)",
+                  padding: "5px 8px",
+                  fontSize: 12,
+                  outline: "none",
+                }}
+              >
+                <option value="ALL">All Payment Statuses</option>
+                <option value="PAID">Paid</option>
+                <option value="PENDING">Pending</option>
+                <option value="REFUNDED">Refunded</option>
+              </select>
+              <input
+                type="text"
+                placeholder="Search order # or customer..."
+                value={orderSearch}
+                onChange={(e) => setOrderSearch(e.target.value)}
+                style={{
+                  background: "var(--sa-surface-2)",
+                  border: "1px solid var(--sa-border-subtle)",
+                  borderRadius: "var(--sa-radius-sm)",
+                  color: "var(--sa-text)",
+                  padding: "5px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  width: 200,
+                }}
+              />
             </div>
+          )}
+        </div>
+
+        <div className="sa-card-body no-pad">
+          {dataTab === "daily" ? (
+            filteredRows.length > 0 ? (
+              <table className="sa-table">
+                <thead>
+                  <tr>
+                    <th
+                      style={{ cursor: "pointer", userSelect: "none" }}
+                      onClick={() => toggleSort("day")}
+                    >
+                      Date {sortField === "day" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                    </th>
+                    <th
+                      style={{ cursor: "pointer", userSelect: "none" }}
+                      onClick={() => toggleSort("gross_sales")}
+                    >
+                      Gross Sales {sortField === "gross_sales" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                    </th>
+                    <th
+                      style={{ cursor: "pointer", userSelect: "none" }}
+                      onClick={() => toggleSort("net_sales")}
+                    >
+                      Net Sales {sortField === "net_sales" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                    </th>
+                    <th
+                      style={{ cursor: "pointer", userSelect: "none" }}
+                      onClick={() => toggleSort("orders")}
+                    >
+                      Orders {sortField === "orders" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                    </th>
+                    <th
+                      style={{ cursor: "pointer", userSelect: "none" }}
+                      onClick={() => toggleSort("units")}
+                    >
+                      Units {sortField === "units" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                    </th>
+                    <th
+                      style={{ cursor: "pointer", userSelect: "none" }}
+                      onClick={() => toggleSort("aov")}
+                    >
+                      AOV {sortField === "aov" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRows.map((row) => (
+                    <tr key={row.day}>
+                      <td style={{ fontWeight: 600 }}>{row.day}</td>
+                      <td style={{ fontWeight: 600, color: "var(--sa-emerald)" }}>
+                        {fmtMoney(row.gross_sales)}
+                      </td>
+                      <td>{fmtMoney(row.net_sales)}</td>
+                      <td>{fmtNum(row.orders)}</td>
+                      <td>{fmtNum(row.units)}</td>
+                      <td className="muted">{fmtMoney(row.aov)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="sa-empty" style={{ padding: "var(--sa-space-8)" }}>
+                <div className="sa-empty-icon">🔍</div>
+                <div className="sa-empty-title">No matching dates found</div>
+                <div className="sa-empty-body">Try clearing your search query.</div>
+              </div>
+            )
+          ) : (
+            filteredOrders.length > 0 ? (
+              <table className="sa-table">
+                <thead>
+                  <tr>
+                    <th>Order #</th>
+                    <th>Date / Time</th>
+                    <th>Customer</th>
+                    <th>Items</th>
+                    <th>Payment</th>
+                    <th>Fulfillment</th>
+                    <th>Total</th>
+                    <th style={{ textAlign: "right" }}>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredOrders.map((ord) => (
+                    <tr key={ord.id}>
+                      <td style={{ fontWeight: 600 }}>{ord.name}</td>
+                      <td className="muted">{ord.createdAt?.slice(0, 16).replace("T", " ")}</td>
+                      <td>{ord.customerName}</td>
+                      <td>{ord.units} item(s)</td>
+                      <td>
+                        <span
+                          className={`sa-badge ${
+                            ord.financialStatus === "PAID" ? "success" : "warning"
+                          }`}
+                        >
+                          {ord.financialStatus}
+                        </span>
+                      </td>
+                      <td>
+                        <span
+                          className={`sa-badge ${
+                            ord.fulfillmentStatus === "FULFILLED" ? "success" : "neutral"
+                          }`}
+                        >
+                          {ord.fulfillmentStatus}
+                        </span>
+                      </td>
+                      <td style={{ fontWeight: 600, color: "var(--sa-emerald)" }}>
+                        {fmtMoney(ord.total)}
+                      </td>
+                      <td style={{ textAlign: "right" }}>
+                        <a
+                          href={`https://${shop}/admin/orders/${ord.numericId}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="sa-btn sa-btn-secondary"
+                          style={{ padding: "3px 8px", fontSize: 11 }}
+                        >
+                          View in Admin ↗
+                        </a>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="sa-empty" style={{ padding: "var(--sa-space-8)" }}>
+                <div className="sa-empty-icon">🛍️</div>
+                <div className="sa-empty-title">No orders found in this period</div>
+                <div className="sa-empty-body">
+                  Orders will automatically appear here as they are placed on your storefront.
+                </div>
+              </div>
+            )
           )}
         </div>
       </div>

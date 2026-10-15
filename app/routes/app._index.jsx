@@ -1,5 +1,5 @@
-import { useState, useMemo } from "react";
-import { useLoaderData, useFetcher, useRevalidator, useRouteError } from "react-router";
+import { useState } from "react";
+import { useLoaderData, useFetcher, useSearchParams, useRouteError, Link } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
@@ -9,7 +9,12 @@ import {
   computeSalesAnalytics,
 } from "../services/analytics.server";
 import { runStoreScan } from "../services/scanner.server";
-import { executeAppFix } from "../services/fixes.server";
+import { executeAppFix, bulkFixAllCritical } from "../services/fixes.server";
+import {
+  syncStoreSalesHistory,
+  syncStoreCatalogSnapshots,
+  getStoreSyncStatus,
+} from "../services/sync.server";
 import prisma from "../db.server";
 
 const DATE_RANGES = [
@@ -32,11 +37,6 @@ function fmtMoney(val) {
 function fmtNum(val) {
   if (val == null || isNaN(val)) return "0";
   return new Intl.NumberFormat("en-US").format(val);
-}
-
-function fmtPct(val) {
-  if (val == null || isNaN(val)) return "0%";
-  return `${val >= 0 ? "+" : ""}${val.toFixed(1)}%`;
 }
 
 // ─── LOADER ───────────────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ export const loader = async ({ request }) => {
   let resolvedCount = 0;
   try {
     dbProblems = await prisma.problem.findMany({
-      where: { shop, resolvedAt: null },
+      where: { shop, resolvedAt: null, ignoredAt: null },
       orderBy: { createdAt: "desc" },
     });
     resolvedCount = await prisma.problem.count({
@@ -144,6 +144,9 @@ export const loader = async ({ request }) => {
     return inv > 0 && inv <= 5;
   }).length;
 
+  // Background sync metadata
+  const syncStatus = await getStoreSyncStatus(shop);
+
   return {
     shop,
     since,
@@ -156,7 +159,7 @@ export const loader = async ({ request }) => {
       ...scanStats,
       categories: categoryCounts,
     },
-    topProblems: dbProblems.slice(0, 6),
+    topProblems: dbProblems.slice(0, 8),
     catalogStats: {
       total: catalog.length,
       outOfStock: outOfStockCount,
@@ -167,6 +170,7 @@ export const loader = async ({ request }) => {
       returning: retCust,
       total: newCust + retCust,
     },
+    syncStatus,
   };
 };
 
@@ -199,6 +203,35 @@ export const action = async ({ request }) => {
     }
   }
 
+  if (intent === "ignore_problem") {
+    const problemId = formData.get("problemId");
+    try {
+      await executeAppFix(admin, session.shop, {
+        problemId,
+        actionKey: "IGNORE_PROBLEM",
+      });
+      return {
+        success: true,
+        message: "Problem dismissed from active queue.",
+        ignoredId: problemId,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Failed to dismiss problem." };
+    }
+  }
+
+  if (intent === "bulk_fix_critical") {
+    try {
+      const result = await bulkFixAllCritical(admin, session.shop);
+      return {
+        success: true,
+        message: result.message,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Bulk fix failed." };
+    }
+  }
+
   if (intent === "rescan") {
     try {
       const scanData = await runStoreScan(admin, session.shop);
@@ -208,6 +241,21 @@ export const action = async ({ request }) => {
       };
     } catch (err) {
       return { success: false, error: err.message || "Scan failed." };
+    }
+  }
+
+  if (intent === "sync_all") {
+    try {
+      const salesResult = await syncStoreSalesHistory(admin, session.shop, 30);
+      const catalogResult = await syncStoreCatalogSnapshots(admin, session.shop);
+      const scanResult = await runStoreScan(admin, session.shop);
+
+      return {
+        success: true,
+        message: `Store synchronized! Synced ${salesResult.ordersSynced} orders, ${catalogResult.productsSynced} products. Health score: ${scanResult.healthScore}/100.`,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Full sync failed." };
     }
   }
 
@@ -253,7 +301,7 @@ function HealthRing({ score }) {
         </text>
         <text
           x="65"
-          y="82"
+          y="80"
           textAnchor="middle"
           dominantBaseline="middle"
           fill="var(--sa-text-muted)"
@@ -338,16 +386,15 @@ export default function OverviewPage() {
     topProblems,
     catalogStats,
     customers,
+    syncStatus,
   } = useLoaderData();
 
-  const revalidator = useRevalidator();
+  const [searchParams, setSearchParams] = useSearchParams();
   const actionFetcher = useFetcher();
 
-  const [activePeriod, setActivePeriod] = useState(
-    DATE_RANGES.findIndex((r) => r.sinceExpr === since) !== -1
-      ? DATE_RANGES.findIndex((r) => r.sinceExpr === since)
-      : 1
-  );
+  const activePeriod = DATE_RANGES.findIndex((r) => r.sinceExpr === since) !== -1
+    ? DATE_RANGES.findIndex((r) => r.sinceExpr === since)
+    : 1;
 
   const [chartView, setChartView] = useState("revenue"); // 'revenue' | 'orders'
 
@@ -359,16 +406,24 @@ export default function OverviewPage() {
     totalCustomers > 0 ? `${((customers.returning / totalCustomers) * 100).toFixed(0)}%` : "0%";
 
   const handlePeriodChange = (idx) => {
-    setActivePeriod(idx);
     const { sinceExpr } = DATE_RANGES[idx];
-    const url = new URL(window.location.href);
-    url.searchParams.set("since", sinceExpr);
-    window.history.pushState({}, "", url);
-    revalidator.revalidate();
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set("since", sinceExpr);
+      return next;
+    });
   };
 
   const handleRunScan = () => {
     actionFetcher.submit({ intent: "rescan" }, { method: "POST" });
+  };
+
+  const handleSyncAll = () => {
+    actionFetcher.submit({ intent: "sync_all" }, { method: "POST" });
+  };
+
+  const handleBulkFixCritical = () => {
+    actionFetcher.submit({ intent: "bulk_fix_critical" }, { method: "POST" });
   };
 
   const handleQuickFix = (problem) => {
@@ -384,7 +439,25 @@ export default function OverviewPage() {
     );
   };
 
-  const isScanning = actionFetcher.state === "submitting" && actionFetcher.formData?.get("intent") === "rescan";
+  const handleIgnoreProblem = (problemId) => {
+    actionFetcher.submit(
+      {
+        intent: "ignore_problem",
+        problemId,
+      },
+      { method: "POST" }
+    );
+  };
+
+  const isScanning =
+    actionFetcher.state === "submitting" &&
+    actionFetcher.formData?.get("intent") === "rescan";
+  const isSyncing =
+    actionFetcher.state === "submitting" &&
+    actionFetcher.formData?.get("intent") === "sync_all";
+  const isBulkFixing =
+    actionFetcher.state === "submitting" &&
+    actionFetcher.formData?.get("intent") === "bulk_fix_critical";
 
   return (
     <div className="sa-page sa-fade-in">
@@ -408,6 +481,15 @@ export default function OverviewPage() {
               </button>
             ))}
           </div>
+          <button
+            onClick={handleSyncAll}
+            disabled={isSyncing}
+            className="sa-btn sa-btn-secondary"
+            style={{ fontSize: 12, padding: "5px 12px" }}
+            title="Synchronize historical sales snapshots, catalog cache, and diagnostics"
+          >
+            {isSyncing ? "⚡ Syncing..." : "⚡ Sync Store"}
+          </button>
           <button
             onClick={handleRunScan}
             disabled={isScanning}
@@ -460,7 +542,15 @@ export default function OverviewPage() {
             padding: "14px 18px",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: 10,
+            }}
+          >
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span style={{ fontSize: 22 }}>🚨</span>
               <div>
@@ -472,9 +562,23 @@ export default function OverviewPage() {
                 </div>
               </div>
             </div>
-            <a href="/app/problems" className="sa-btn sa-btn-danger" style={{ fontSize: 12, padding: "5px 12px" }}>
-              Review & Fix All →
-            </a>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                disabled={isBulkFixing}
+                onClick={handleBulkFixCritical}
+                className="sa-btn sa-btn-danger"
+                style={{ fontSize: 12, padding: "5px 12px" }}
+              >
+                {isBulkFixing ? "Fixing..." : "⚡ 1-Click Fix All Critical"}
+              </button>
+              <Link
+                to="/app/problems"
+                className="sa-btn sa-btn-secondary"
+                style={{ fontSize: 12, padding: "5px 12px" }}
+              >
+                Review All →
+              </Link>
+            </div>
           </div>
         </div>
       )}
@@ -491,7 +595,7 @@ export default function OverviewPage() {
         <MetricCard
           label="Net Sales"
           value={fmtMoney(kpi.netSales)}
-          accent="var(--sa-cyan)"
+          accent="var(--sa-teal)"
           subtitle={
             kpi.grossSales > 0
               ? `${Math.round((kpi.netSales / kpi.grossSales) * 100)}% of gross`
@@ -515,7 +619,7 @@ export default function OverviewPage() {
           label="Units Sold"
           value={fmtNum(kpi.unitsSold)}
           delta={kpi.unitsGrowth}
-          accent="var(--sa-violet)"
+          accent="var(--sa-purple)"
         />
         <MetricCard
           label="Active SKUs"
@@ -551,204 +655,191 @@ export default function OverviewPage() {
                   </span>
                 )}
               </div>
-              <div className="sa-date-pills">
+              <div className="sa-tabs" style={{ marginBottom: 0 }}>
                 <button
-                  className={`sa-date-pill${chartView === "revenue" ? " active" : ""}`}
+                  className={`sa-tab${chartView === "revenue" ? " active" : ""}`}
                   onClick={() => setChartView("revenue")}
+                  style={{ fontSize: 12, padding: "4px 10px" }}
                 >
-                  Revenue
+                  Revenue ($)
                 </button>
                 <button
-                  className={`sa-date-pill${chartView === "orders" ? " active" : ""}`}
+                  className={`sa-tab${chartView === "orders" ? " active" : ""}`}
                   onClick={() => setChartView("orders")}
+                  style={{ fontSize: 12, padding: "4px 10px" }}
                 >
-                  Orders
+                  Orders (#)
                 </button>
               </div>
             </div>
 
             <div className="sa-card-body">
-              {trendRows.length > 0 ? (
-                <div>
-                  <div style={{ width: "100%", height: 220, position: "relative" }}>
-                    <svg
-                      viewBox="0 0 800 200"
-                      preserveAspectRatio="none"
-                      style={{ width: "100%", height: "100%" }}
-                    >
-                      <defs>
-                        <linearGradient id="dashGrad" x1="0" y1="0" x2="0" y2="1">
-                          <stop
-                            offset="0%"
-                            stopColor={chartView === "revenue" ? "#10b981" : "#6366f1"}
-                            stopOpacity="0.3"
-                          />
-                          <stop
-                            offset="100%"
-                            stopColor={chartView === "revenue" ? "#10b981" : "#6366f1"}
-                            stopOpacity="0"
-                          />
-                        </linearGradient>
-                      </defs>
+              {trendRows.length > 1 ? (
+                <div style={{ width: "100%", height: 210, position: "relative" }}>
+                  <svg width="100%" height="100%" viewBox="0 0 600 200" preserveAspectRatio="none">
+                    <defs>
+                      <linearGradient id="dashGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="var(--sa-emerald)" stopOpacity="0.25" />
+                        <stop offset="100%" stopColor="var(--sa-emerald)" stopOpacity="0.0" />
+                      </linearGradient>
+                    </defs>
 
-                      {(() => {
-                        const vals = trendRows.map((r) =>
-                          chartView === "revenue" ? r.gross_sales || 0 : r.orders || 0
-                        );
-                        const maxV = Math.max(...vals, 1);
-                        const pts = vals
-                          .map((v, i) => {
-                            const x = (i / Math.max(vals.length - 1, 1)) * 780 + 10;
-                            const y = 190 - (v / maxV) * 170;
-                            return `${x},${y}`;
-                          })
-                          .join(" ");
+                    {/* Area polygon */}
+                    <polygon
+                      points={`20,180 ${trendRows
+                        .map((r, i) => {
+                          const x = 20 + (i / Math.max(trendRows.length - 1, 1)) * 560;
+                          const val = chartView === "revenue" ? r.gross_sales : r.orders;
+                          const maxVal = Math.max(
+                            ...trendRows.map((d) => (chartView === "revenue" ? d.gross_sales : d.orders)),
+                            1
+                          );
+                          const y = 180 - (val / maxVal) * 160;
+                          return `${x},${y}`;
+                        })
+                        .join(" ")} 580,180`}
+                      fill="url(#dashGrad)"
+                    />
 
-                        const areaBase = `10,190 ${pts} ${
-                          ((vals.length - 1) / Math.max(vals.length - 1, 1)) * 780 + 10
-                        },190`;
+                    {/* Polyline curve */}
+                    <polyline
+                      points={trendRows
+                        .map((r, i) => {
+                          const x = 20 + (i / Math.max(trendRows.length - 1, 1)) * 560;
+                          const val = chartView === "revenue" ? r.gross_sales : r.orders;
+                          const maxVal = Math.max(
+                            ...trendRows.map((d) => (chartView === "revenue" ? d.gross_sales : d.orders)),
+                            1
+                          );
+                          const y = 180 - (val / maxVal) * 160;
+                          return `${x},${y}`;
+                        })
+                        .join(" ")}
+                      fill="none"
+                      stroke={chartView === "revenue" ? "var(--sa-emerald)" : "var(--sa-indigo)"}
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                    />
 
-                        const strokeColor = chartView === "revenue" ? "#10b981" : "#6366f1";
-
-                        return (
-                          <>
-                            <polygon points={areaBase} fill="url(#dashGrad)" />
-                            <polyline
-                              points={pts}
-                              fill="none"
-                              stroke={strokeColor}
-                              strokeWidth="2.5"
-                              strokeLinejoin="round"
-                              strokeLinecap="round"
-                            />
-                            {trendRows.map((r, i) => {
-                              const val = chartView === "revenue" ? r.gross_sales || 0 : r.orders || 0;
-                              const cx = (i / Math.max(vals.length - 1, 1)) * 780 + 10;
-                              const cy = 190 - (val / maxV) * 170;
-                              return (
-                                <circle
-                                  key={r.day}
-                                  cx={cx}
-                                  cy={cy}
-                                  r={trendRows.length > 25 ? 2 : 4}
-                                  fill={strokeColor}
-                                  stroke="var(--sa-surface)"
-                                  strokeWidth="1.5"
-                                />
-                              );
-                            })}
-                          </>
-                        );
-                      })()}
-                    </svg>
-                  </div>
+                    {/* Point circles */}
+                    {trendRows.map((r, i) => {
+                      const x = 20 + (i / Math.max(trendRows.length - 1, 1)) * 560;
+                      const val = chartView === "revenue" ? r.gross_sales : r.orders;
+                      const maxVal = Math.max(
+                        ...trendRows.map((d) => (chartView === "revenue" ? d.gross_sales : d.orders)),
+                        1
+                      );
+                      const y = 180 - (val / maxVal) * 160;
+                      return (
+                        <circle
+                          key={r.day}
+                          cx={x}
+                          cy={y}
+                          r="3.5"
+                          fill="var(--sa-surface-1)"
+                          stroke={chartView === "revenue" ? "var(--sa-emerald)" : "var(--sa-indigo)"}
+                          strokeWidth="2"
+                        >
+                          <title>{`${r.day}: ${chartView === "revenue" ? fmtMoney(val) : `${val} orders`}`}</title>
+                        </circle>
+                      );
+                    })}
+                  </svg>
                   <div
                     style={{
                       display: "flex",
                       justifyContent: "space-between",
-                      fontSize: 11,
-                      color: "var(--sa-text-dimmed)",
-                      marginTop: 6,
+                      padding: "0 20px",
+                      fontSize: 10,
+                      color: "var(--sa-text-muted)",
+                      marginTop: 4,
                     }}
                   >
                     <span>{trendRows[0]?.day}</span>
+                    <span>{trendRows[Math.floor(trendRows.length / 2)]?.day}</span>
                     <span>{trendRows[trendRows.length - 1]?.day}</span>
                   </div>
                 </div>
               ) : (
-                <div className="sa-empty">
-                  <div className="sa-empty-icon">📊</div>
-                  <div className="sa-empty-title">No transactions recorded</div>
+                <div className="sa-empty" style={{ padding: "var(--sa-space-6)" }}>
+                  <div className="sa-empty-icon">📈</div>
+                  <div className="sa-empty-title">Insufficient Sales Points</div>
                   <div className="sa-empty-body">
-                    When sales activity takes place, your revenue curve and velocity trends will appear here.
+                    Orders will dynamically populate this chart as they arrive.
                   </div>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Catalog & Customer Health Summary */}
+          {/* Quick Module Navigation & Drilldown Cards */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--sa-space-4)" }}>
-            <div className="sa-card">
-              <div className="sa-card-header">
-                <div className="sa-card-title">Inventory Health</div>
-                <a href="/app/inventory" className="sa-btn sa-btn-ghost" style={{ padding: "2px 8px", fontSize: 11 }}>
-                  Manage →
-                </a>
+            <Link
+              to="/app/sales"
+              className="sa-card"
+              style={{
+                textDecoration: "none",
+                color: "inherit",
+                padding: "16px",
+                borderLeft: "4px solid var(--sa-emerald)",
+                transition: "transform 0.15s ease",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>📊 Sales Analytics</div>
+                <span style={{ fontSize: 12 }}>↗</span>
               </div>
-              <div className="sa-card-body">
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-                  <span className="sa-text-muted" style={{ fontSize: 13 }}>In-Stock Active:</span>
-                  <strong style={{ color: "var(--sa-emerald)" }}>
-                    {fmtNum(catalogStats.total - catalogStats.outOfStock)}
-                  </strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Low Stock Alert:</span>
-                  <strong style={{ color: "var(--sa-amber)" }}>{fmtNum(catalogStats.lowStock)}</strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Out of Stock:</span>
-                  <strong style={{ color: catalogStats.outOfStock > 0 ? "var(--sa-rose)" : "inherit" }}>
-                    {fmtNum(catalogStats.outOfStock)}
-                  </strong>
-                </div>
+              <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+                Day-of-week analysis, AOV growth, and order drilldown tables.
               </div>
-            </div>
+            </Link>
 
-            <div className="sa-card">
-              <div className="sa-card-header">
-                <div className="sa-card-title">Customer Retention</div>
-                <span className="sa-badge neutral">{returningRate} Returning</span>
+            <Link
+              to="/app/products"
+              className="sa-card"
+              style={{
+                textDecoration: "none",
+                color: "inherit",
+                padding: "16px",
+                borderLeft: "4px solid var(--sa-indigo)",
+                transition: "transform 0.15s ease",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>📦 Product Intelligence</div>
+                <span style={{ fontSize: 12 }}>↗</span>
               </div>
-              <div className="sa-card-body">
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Total Buyers:</span>
-                  <strong>{fmtNum(customers.total)}</strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-                  <span className="sa-text-muted" style={{ fontSize: 13 }}>New Customers:</span>
-                  <strong style={{ color: "var(--sa-cyan)" }}>{fmtNum(customers.new)}</strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span className="sa-text-muted" style={{ fontSize: 13 }}>Repeat Buyers:</span>
-                  <strong style={{ color: "var(--sa-violet)" }}>{fmtNum(customers.returning)}</strong>
-                </div>
+              <div className="sa-text-muted sa-text-small" style={{ marginTop: 4 }}>
+                Velocity, days of supply, stockout risk alerts, and dead stock.
               </div>
-            </div>
+            </Link>
           </div>
 
-          {/* Problem Categories Breakdown */}
+          {/* Customer Retention Snapshot */}
           <div className="sa-card">
             <div className="sa-card-header">
-              <div className="sa-card-title">Diagnostic Categories</div>
-              <span className="sa-badge neutral">{health.total} Total Issues</span>
+              <div className="sa-card-title">Customer Retention Telemetry</div>
+              <span className="sa-badge neutral">{returningRate} Returning</span>
             </div>
             <div className="sa-card-body">
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, textAlign: "center" }}>
-                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-emerald)" }}>
-                    {health.categories.inventory}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: 6 }}>
+                  <div className="sa-text-muted sa-text-small">Total Buyers</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, marginTop: 4 }}>
+                    {fmtNum(customers.total)}
                   </div>
-                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>Inventory</div>
                 </div>
-                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-indigo)" }}>
-                    {health.categories.product}
+                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: 6 }}>
+                  <div className="sa-text-muted sa-text-small">New Customers</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-cyan)", marginTop: 4 }}>
+                    {fmtNum(customers.new)}
                   </div>
-                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>Product</div>
                 </div>
-                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-amber)" }}>
-                    {health.categories.seo}
+                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: 6 }}>
+                  <div className="sa-text-muted sa-text-small">Repeat Buyers</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-purple)", marginTop: 4 }}>
+                    {fmtNum(customers.returning)}
                   </div>
-                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>SEO</div>
-                </div>
-                <div style={{ background: "var(--sa-surface-2)", padding: 12, borderRadius: "var(--sa-radius-sm)" }}>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: "var(--sa-violet)" }}>
-                    {health.categories.performance}
-                  </div>
-                  <div className="sa-text-muted sa-text-small" style={{ marginTop: 2 }}>Speed</div>
                 </div>
               </div>
             </div>
@@ -786,7 +877,7 @@ export default function OverviewPage() {
                   <div className="sa-text-muted sa-text-small">Warnings</div>
                 </div>
                 <div style={{ textAlign: "center" }}>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-violet)" }}>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--sa-purple)" }}>
                     {health.notice}
                   </div>
                   <div className="sa-text-muted sa-text-small">Notices</div>
@@ -805,9 +896,13 @@ export default function OverviewPage() {
           <div className="sa-card">
             <div className="sa-card-header">
               <div className="sa-card-title">Top Priority Issues</div>
-              <a href="/app/problems" className="sa-btn sa-btn-ghost" style={{ padding: "4px 10px", fontSize: 12 }}>
+              <Link
+                to="/app/problems"
+                className="sa-btn sa-btn-ghost"
+                style={{ padding: "4px 10px", fontSize: 12 }}
+              >
                 View all ({health.total}) →
-              </a>
+              </Link>
             </div>
             <div className="sa-card-body no-pad">
               {topProblems.length > 0 ? (
@@ -838,7 +933,9 @@ export default function OverviewPage() {
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "space-between",
-                          marginTop: 6,
+                          marginTop: 8,
+                          flexWrap: "wrap",
+                          gap: 6,
                         }}
                       >
                         <div style={{ fontSize: 11, color: "var(--sa-text-dimmed)" }}>
@@ -855,12 +952,21 @@ export default function OverviewPage() {
                               ⚡ Quick Fix
                             </button>
                           )}
+                          <button
+                            onClick={() => handleIgnoreProblem(prob.id)}
+                            disabled={actionFetcher.state === "submitting"}
+                            className="sa-btn sa-btn-ghost"
+                            style={{ padding: "3px 7px", fontSize: 11 }}
+                            title="Dismiss issue from active queue"
+                          >
+                            Dismiss
+                          </button>
                           {prob.resourceUrl && (
                             <a
                               href={prob.resourceUrl}
                               target="_blank"
                               rel="noreferrer"
-                              className="sa-btn sa-btn-ghost"
+                              className="sa-btn sa-btn-secondary"
                               style={{ padding: "3px 9px", fontSize: 11 }}
                             >
                               Shopify ↗

@@ -4,7 +4,24 @@ import prisma from "../db.server.js";
 // Safely executes automated fixes via Shopify Admin GraphQL mutations and
 // updates local problem resolution records.
 
-export async function executeAppFix(admin, shop, { problemId, actionKey, resourceId, resourceTitle }) {
+export async function executeAppFix(admin, shop, { problemId, actionKey, resourceId, resourceTitle, quantityDelta, targetStatus }) {
+  // If action is to IGNORE or RESOLVE problem directly in database
+  if (actionKey === "IGNORE_PROBLEM" && problemId) {
+    await prisma.problem.update({
+      where: { id: problemId },
+      data: { ignoredAt: new Date() },
+    });
+    return { success: true, message: "Problem dismissed from active queue." };
+  }
+
+  if (actionKey === "RESOLVE_PROBLEM" && problemId) {
+    await prisma.problem.update({
+      where: { id: problemId },
+      data: { resolvedAt: new Date() },
+    });
+    return { success: true, message: "Problem marked as resolved." };
+  }
+
   if (!resourceId) {
     throw new Error("Missing resource ID for fix operation.");
   }
@@ -104,6 +121,133 @@ export async function executeAppFix(admin, shop, { problemId, actionKey, resourc
       break;
     }
 
+    case "SET_STATUS": {
+      const nextStatus = (targetStatus || "ACTIVE").toUpperCase();
+      const res = await admin.graphql(
+        `#graphql
+        mutation updateProductStatus($product: ProductUpdateInput!) {
+          productUpdate(product: $product) {
+            product {
+              id
+              status
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }`,
+        {
+          variables: {
+            product: {
+              id: formattedResourceId,
+              status: nextStatus,
+            },
+          },
+        }
+      );
+      const json = await res.json();
+      const userErrors = json.data?.productUpdate?.userErrors ?? [];
+      if (userErrors.length > 0) {
+        throw new Error(userErrors.map((e) => e.message).join(", "));
+      }
+      result = { success: true, message: `Product status updated to ${nextStatus}.` };
+      break;
+    }
+
+    case "ADJUST_INVENTORY": {
+      const delta = parseInt(quantityDelta || "10", 10);
+      if (isNaN(delta) || delta === 0) {
+        throw new Error("Invalid inventory adjustment delta.");
+      }
+
+      // Query primary location & inventory item ID for the product
+      const contextRes = await admin.graphql(
+        `#graphql
+        query getInventoryContext($id: ID!) {
+          locations(first: 1) {
+            edges {
+              node {
+                id
+                name
+              }
+            }
+          }
+          product(id: $id) {
+            id
+            title
+            variants(first: 5) {
+              edges {
+                node {
+                  id
+                  title
+                  inventoryItem {
+                    id
+                  }
+                }
+              }
+            }
+          }
+        }`,
+        { variables: { id: formattedResourceId } }
+      );
+      const contextJson = await contextRes.json();
+      const locationId = contextJson.data?.locations?.edges?.[0]?.node?.id;
+      const variantNode = contextJson.data?.product?.variants?.edges?.[0]?.node;
+      const inventoryItemId = variantNode?.inventoryItem?.id;
+
+      if (!locationId || !inventoryItemId) {
+        throw new Error("Unable to locate inventory item or store location for restocking.");
+      }
+
+      const adjustRes = await admin.graphql(
+        `#graphql
+        mutation adjustInventory($input: InventoryAdjustQuantitiesInput!) {
+          inventoryAdjustQuantities(input: $input) {
+            inventoryAdjustmentGroup {
+              id
+              changes {
+                name
+                delta
+                quantityAfterChange
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }`,
+        {
+          variables: {
+            input: {
+              reason: "restock",
+              name: "available",
+              changes: [
+                {
+                  delta,
+                  inventoryItemId,
+                  locationId,
+                },
+              ],
+            },
+          },
+        }
+      );
+
+      const adjustJson = await adjustRes.json();
+      const userErrors = adjustJson.data?.inventoryAdjustQuantities?.userErrors ?? [];
+      if (userErrors.length > 0) {
+        throw new Error(userErrors.map((e) => e.message).join(", "));
+      }
+
+      result = {
+        success: true,
+        message: `Restocked ${delta > 0 ? `+${delta}` : delta} units successfully via Shopify Inventory API.`,
+      };
+      break;
+    }
+
     case "FIX_MISSING_DESCRIPTION": {
       const { title: cleanTitle, vendor: prodVendor } = await resolveProductInfo();
       const vendorCredit = prodVendor ? ` by <em>${prodVendor}</em>` : "";
@@ -195,7 +339,7 @@ export async function executeAppFix(admin, shop, { problemId, actionKey, resourc
       throw new Error(`Unsupported fix action key: ${actionKey}`);
   }
 
-  // Update Problem record in Prisma database
+  // Update Problem record in Prisma database if resolved
   if (problemId) {
     try {
       await prisma.problem.update({
@@ -216,7 +360,7 @@ export async function executeAppFix(admin, shop, { problemId, actionKey, resourc
         shop,
         action: "FIX_APPLIED",
         resource: resourceTitle || resourceId,
-        details: `${actionKey}: ${result?.message || "Remediation applied"}`,
+        details: `${effectiveActionKey}: ${result?.message || "Remediation applied"}`,
       },
     });
   } catch {
@@ -224,4 +368,75 @@ export async function executeAppFix(admin, shop, { problemId, actionKey, resourc
   }
 
   return result;
+}
+
+// ─── BULK FIXES ───────────────────────────────────────────────────────────────
+
+export async function bulkFixAllCritical(admin, shop) {
+  const criticalProblems = await prisma.problem.findMany({
+    where: {
+      shop,
+      severity: "CRITICAL",
+      fixType: "APP_FIX",
+      resolvedAt: null,
+    },
+    take: 20,
+  });
+
+  let fixedCount = 0;
+  const errors = [];
+
+  for (const prob of criticalProblems) {
+    try {
+      await executeAppFix(admin, shop, {
+        problemId: prob.id,
+        actionKey: prob.actionKey || "FIX_OUT_OF_STOCK",
+        resourceId: prob.resourceId,
+        resourceTitle: prob.title,
+      });
+      fixedCount++;
+    } catch (err) {
+      errors.push(`${prob.title}: ${err.message}`);
+    }
+  }
+
+  return {
+    success: true,
+    message: `Resolved ${fixedCount} critical issues automatically.${errors.length > 0 ? ` (${errors.length} skipped)` : ""}`,
+    fixedCount,
+    errors,
+  };
+}
+
+export async function bulkFixSeo(admin, shop) {
+  const seoProblems = await prisma.problem.findMany({
+    where: {
+      shop,
+      category: "seo",
+      fixType: "APP_FIX",
+      resolvedAt: null,
+    },
+    take: 25,
+  });
+
+  let fixedCount = 0;
+  for (const prob of seoProblems) {
+    try {
+      await executeAppFix(admin, shop, {
+        problemId: prob.id,
+        actionKey: "FIX_SEO_METADATA",
+        resourceId: prob.resourceId,
+        resourceTitle: prob.title,
+      });
+      fixedCount++;
+    } catch {
+      // continue
+    }
+  }
+
+  return {
+    success: true,
+    message: `Optimized SEO tags for ${fixedCount} products.`,
+    fixedCount,
+  };
 }

@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { Link, Outlet, useLoaderData, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
@@ -30,6 +31,76 @@ export const action = async (args) => {
   }
 };
 
+function AppBridgeScriptRunner({ html }) {
+  useEffect(() => {
+    if (!html) return;
+    try {
+      // 1. If script contains window.open (OAuth redirect), navigate top window directly
+      const match = html.match(/window\.open\(([^,]+),\s*([^)]+)\)/);
+      if (match) {
+        const dest = JSON.parse(match[1]);
+        const target = JSON.parse(match[2]);
+        if (target === "_top" && window.top) {
+          window.top.location.href = dest;
+          return;
+        } else {
+          window.location.href = dest;
+          return;
+        }
+      }
+
+      // 2. Dynamically create script elements so modern browsers execute them
+      const temp = document.createElement("div");
+      temp.innerHTML = html;
+      const scripts = temp.querySelectorAll("script");
+      scripts.forEach((s) => {
+        const newScript = document.createElement("script");
+        Array.from(s.attributes).forEach((attr) => {
+          newScript.setAttribute(attr.name, attr.value);
+        });
+        newScript.textContent = s.textContent;
+        document.body.appendChild(newScript);
+      });
+    } catch (e) {
+      console.error("AppBridge script runner error:", e);
+    }
+  }, [html]);
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        minHeight: "70vh",
+        background: "#faf8f5",
+        fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      }}
+    >
+      <div
+        style={{
+          background: "#ffffff",
+          border: "1px solid #e6dfd1",
+          borderRadius: "14px",
+          padding: "36px 40px",
+          textAlign: "center",
+          boxShadow: "0 8px 30px rgba(180, 83, 9, 0.08)",
+          maxWidth: "460px",
+        }}
+      >
+        <div style={{ fontSize: "40px", marginBottom: "14px" }}>⚡</div>
+        <div style={{ fontSize: "18px", fontWeight: "800", color: "#0f172a", marginBottom: "8px" }}>
+          Authenticating Store Session
+        </div>
+        <div style={{ fontSize: "13px", color: "#475569", lineHeight: "1.5" }}>
+          Connecting securely to Shopify Admin...
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { apiKey } = useLoaderData();
 
@@ -59,12 +130,12 @@ export function ErrorBoundary() {
   const error = useRouteError();
   console.error("App Root ErrorBoundary caught error:", error);
 
-  // If this is a Shopify App Bridge script (OAuth redirect / session approval), execute it immediately as HTML!
+  // If this is a Shopify App Bridge script (OAuth redirect / session approval), execute it immediately!
   if (
     typeof error?.data === "string" &&
     (error.data.includes("<script") || error.data.includes("app-bridge"))
   ) {
-    return <div dangerouslySetInnerHTML={{ __html: error.data }} />;
+    return <AppBridgeScriptRunner html={error.data} />;
   }
 
   if (

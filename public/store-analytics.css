@@ -567,3 +567,80 @@
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+
+/* ─── Form Inputs & Dropdowns ────────────────────────────────────────────────── */
+.sa-select, .sa-input {
+  background: var(--sa-surface-2);
+  border: 1px solid var(--sa-border);
+  color: var(--sa-text);
+  border-radius: var(--sa-radius-sm);
+  padding: 6px 12px;
+  font-family: var(--sa-font);
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--sa-transition);
+}
+
+.sa-select:focus, .sa-input:focus {
+  border-color: var(--sa-emerald);
+}
+
+.sa-select option {
+  background: var(--sa-surface-2);
+  color: var(--sa-text);
+}
+
+/* ─── Speed & Health Engine ─────────────────────────────────────────────────── */
+.sa-speed-gauge-card {
+  background: var(--sa-surface-2);
+  border-radius: var(--sa-radius);
+  border: 1px solid var(--sa-border);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sa-device-toggle {
+  display: inline-flex;
+  background: var(--sa-surface-2);
+  border: 1px solid var(--sa-border);
+  border-radius: var(--sa-radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.sa-device-btn {
+  background: transparent;
+  border: none;
+  color: var(--sa-text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all var(--sa-transition);
+}
+
+.sa-device-btn.active {
+  background: var(--sa-surface);
+  color: var(--sa-text);
+  box-shadow: var(--sa-shadow-sm);
+}
+
+.sa-vitals-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.sa-vital-box {
+  background: var(--sa-surface-3);
+  border-radius: var(--sa-radius-sm);
+  padding: 10px 12px;
+  border-left: 3px solid var(--sa-border);
+}
+

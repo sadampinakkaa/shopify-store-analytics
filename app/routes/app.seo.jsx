@@ -3,6 +3,8 @@ import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { runSeoAudit, fixSeoSnippet } from "../services/seo.server";
+import { bulkFixSeo } from "../services/fixes.server";
+import prisma from "../db.server";
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -20,7 +22,7 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
 
@@ -30,9 +32,33 @@ export const action = async ({ request }) => {
 
     try {
       const res = await fixSeoSnippet(admin, { productId, productTitle });
+      try {
+        const numericId = productId.replace(/\D/g, "");
+        await prisma.problem.updateMany({
+          where: {
+            shop: session.shop,
+            OR: [
+              { resourceId: productId },
+              { id: `missing-seo-${numericId}` },
+            ],
+          },
+          data: { resolvedAt: new Date() },
+        });
+      } catch {
+        // Non-critical
+      }
       return { success: true, message: `Updated SEO metadata for "${productTitle}".` };
     } catch (err) {
       return { success: false, error: err.message };
+    }
+  }
+
+  if (intent === "bulk_fix_seo") {
+    try {
+      const result = await bulkFixSeo(admin, session.shop);
+      return { success: true, message: result.message };
+    } catch (err) {
+      return { success: false, error: err.message || "Bulk SEO optimization failed." };
     }
   }
 
@@ -56,6 +82,10 @@ export default function SeoPage() {
       },
       { method: "post" }
     );
+  };
+
+  const handleBulkFixSeo = () => {
+    fetcher.submit({ intent: "bulk_fix_seo" }, { method: "post" });
   };
 
   const filteredIssues = issues.filter((i) => {
@@ -84,6 +114,18 @@ export default function SeoPage() {
           </div>
         </div>
         <div className="sa-inline">
+          {issues.filter((i) => i.canAutoFix && !fixedIssueIds.has(i.id)).length > 0 && (
+            <button
+              onClick={handleBulkFixSeo}
+              disabled={fetcher.state === "submitting"}
+              className="sa-btn sa-btn-primary"
+              style={{ fontSize: 12, padding: "5px 12px" }}
+            >
+              {fetcher.state === "submitting" && fetcher.formData?.get("intent") === "bulk_fix_seo"
+                ? "Optimizing..."
+                : `⚡ 1-Click Optimize All (${issues.filter((i) => i.canAutoFix && !fixedIssueIds.has(i.id)).length})`}
+            </button>
+          )}
           <span className="sa-badge success">🔍 Google & Bing Snippet Audits</span>
         </div>
       </div>

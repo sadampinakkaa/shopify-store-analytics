@@ -103,6 +103,19 @@ export const action = async ({ request }) => {
     }
   }
 
+  if (intent === "ignore_problem") {
+    const problemId = formData.get("problemId");
+    try {
+      await executeAppFix(admin, session.shop, {
+        problemId,
+        actionKey: "IGNORE_PROBLEM",
+      });
+      return { success: true, message: "Problem dismissed from active queue.", ignoredId: problemId };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
   if (intent === "bulk_fix") {
     try {
       const activeFixables = await prisma.problem.findMany({
@@ -146,10 +159,14 @@ export default function ProblemsPage() {
 
   const isScanning = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "run_scan";
   const isBulkFixing = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "bulk_fix";
+  const isFixing = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "app_fix";
 
   useEffect(() => {
     if (fetcher.data?.success && fetcher.data?.fixedId) {
       setFixedProblemIds((prev) => new Set([...prev, fetcher.data.fixedId]));
+    }
+    if (fetcher.data?.success && fetcher.data?.ignoredId) {
+      setFixedProblemIds((prev) => new Set([...prev, fetcher.data.ignoredId]));
     }
     if (fetcher.data?.success && fetcher.formData?.get("intent") === "bulk_fix") {
       setFixedProblemIds(new Set());
@@ -157,30 +174,34 @@ export default function ProblemsPage() {
   }, [fetcher.data]);
 
   const handleFix = (problem) => {
-    const actionKey = problem.actionKey || (
-      problem.id?.startsWith("out-of-stock-") ? "FIX_OUT_OF_STOCK" :
-      problem.id?.startsWith("missing-desc-") ? "FIX_MISSING_DESCRIPTION" :
-      problem.id?.startsWith("missing-seo-") ? "FIX_SEO_METADATA" : ""
-    );
-
     fetcher.submit(
       {
         intent: "app_fix",
         problemId: problem.id,
-        actionKey,
-        resourceId: problem.resourceId,
-        resourceTitle: problem.resourceTitle,
+        actionKey: problem.actionKey || "",
+        resourceId: problem.resourceId || "",
+        resourceTitle: problem.resourceTitle || problem.title,
       },
-      { method: "post", action: "/app/problems" }
+      { method: "post" }
+    );
+  };
+
+  const handleIgnore = (problemId) => {
+    fetcher.submit(
+      {
+        intent: "ignore_problem",
+        problemId,
+      },
+      { method: "post" }
     );
   };
 
   const handleRunScan = () => {
-    fetcher.submit({ intent: "run_scan" }, { method: "post", action: "/app/problems" });
+    fetcher.submit({ intent: "run_scan" }, { method: "post" });
   };
 
   const handleBulkFix = () => {
-    fetcher.submit({ intent: "bulk_fix" }, { method: "post", action: "/app/problems" });
+    fetcher.submit({ intent: "bulk_fix" }, { method: "post" });
   };
 
   const appFixableCount = problems.filter((p) => p.fixType === "APP_FIX" && !fixedProblemIds.has(p.id)).length;
@@ -425,32 +446,58 @@ export default function ProblemsPage() {
                       </div>
                     ) : prob.fixType === "APP_FIX" ? (
                       <>
-                        <button
-                          className="sa-btn sa-btn-primary"
-                          onClick={() => handleFix(prob)}
-                          disabled={isFixing}
-                          style={{ whiteSpace: "nowrap" }}
-                        >
-                          {isFixing ? "Applying Fix..." : "⚡ 1-Click Fix"}
-                        </button>
+                        <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                          <button
+                            className="sa-btn sa-btn-primary"
+                            onClick={() => handleFix(prob)}
+                            disabled={isFixing}
+                            style={{ whiteSpace: "nowrap" }}
+                          >
+                            {isFixing && fetcher.formData?.get("problemId") === prob.id ? "Applying Fix..." : "⚡ 1-Click Fix"}
+                          </button>
+                          <button
+                            className="sa-btn sa-btn-ghost"
+                            onClick={() => handleIgnore(prob.id)}
+                            disabled={fetcher.state !== "idle"}
+                            style={{ whiteSpace: "nowrap", padding: "4px 8px", fontSize: 12 }}
+                            title="Dismiss issue from active queue"
+                          >
+                            Dismiss
+                          </button>
+                        </div>
                         <div style={{ fontSize: 11, color: "var(--sa-text-muted)", marginTop: 4 }}>
                           {prob.actionKey === "FIX_OUT_OF_STOCK" || prob.id?.startsWith("out-of-stock-")
                             ? "Sets status to Draft"
                             : prob.actionKey === "FIX_MISSING_DESCRIPTION" || prob.id?.startsWith("missing-desc-")
                             ? "Generates description"
+                            : prob.actionKey === "FIX_MISSING_SKU" || prob.id?.startsWith("missing-sku-")
+                            ? "Assigns SKU identifier"
+                            : prob.actionKey === "FIX_ZERO_PRICE" || prob.id?.startsWith("zero-price-")
+                            ? "Fixes zero pricing"
                             : "Generates SEO tags"}
                         </div>
                       </>
                     ) : (
-                      <a
-                        href={prob.resourceUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="sa-btn sa-btn-ghost"
-                        style={{ whiteSpace: "nowrap" }}
-                      >
-                        Open in Shopify Admin ↗
-                      </a>
+                      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                        <button
+                          className="sa-btn sa-btn-ghost"
+                          onClick={() => handleIgnore(prob.id)}
+                          disabled={fetcher.state !== "idle"}
+                          style={{ whiteSpace: "nowrap", padding: "4px 8px", fontSize: 12 }}
+                          title="Dismiss issue from active queue"
+                        >
+                          Dismiss
+                        </button>
+                        <a
+                          href={prob.resourceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="sa-btn sa-btn-secondary"
+                          style={{ whiteSpace: "nowrap" }}
+                        >
+                          Open in Shopify ↗
+                        </a>
+                      </div>
                     )}
                   </div>
                 </div>

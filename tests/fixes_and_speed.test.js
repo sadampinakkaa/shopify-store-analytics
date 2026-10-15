@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { executeAppFix } from "../app/services/fixes.server.js";
+import { executeAppFix, bulkFixAllCritical } from "../app/services/fixes.server.js";
 import { getThemeSpeedAudit } from "../app/services/performance.server.js";
 import { getShopifyAdminUrl } from "../app/services/auth.server.js";
 
@@ -143,6 +143,23 @@ describe("Universal 1-Click Fix Engine", () => {
     assert.equal(res.success, true);
     assert.match(sentSeo.title, /Running Shoes/);
     assert.match(sentSeo.description, /running shoes/i);
+  });
+
+  it("executes bulkFixAllCritical safely without throwing errors", async () => {
+    const mockAdmin = {
+      graphql: async () => ({
+        json: async () => ({
+          data: {
+            products: { edges: [] },
+          },
+        }),
+      }),
+    };
+
+    const res = await bulkFixAllCritical(mockAdmin, "test-bulk-store.myshopify.com");
+    assert.equal(res.success, true);
+    assert.ok(typeof res.message === "string");
+    assert.ok(Array.isArray(res.errors));
   });
 });
 

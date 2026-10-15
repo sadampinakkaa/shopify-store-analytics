@@ -74,10 +74,7 @@ export default function ScanHistoryPage() {
   const handleTriggerScan = () => {
     fetcher.submit(
       { intent: "trigger_scan", shop: shop || "" },
-      {
-        method: "post",
-        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
-      }
+      { method: "post" }
     );
   };
 
@@ -272,13 +269,34 @@ export default function ScanHistoryPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Scan ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while loading audit history.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load scan history</div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while loading audit history."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

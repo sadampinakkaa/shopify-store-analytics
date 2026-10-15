@@ -156,10 +156,7 @@ export default function ProductsPage() {
   const handleSyncCatalog = () => {
     syncFetcher.submit(
       { intent: "sync_catalog", shop: shop || "" },
-      {
-        method: "POST",
-        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
-      }
+      { method: "POST" }
     );
   };
 
@@ -291,10 +288,7 @@ export default function ProductsPage() {
         shop: shop || "",
         ...extra,
       },
-      {
-        method: "POST",
-        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
-      }
+      { method: "POST" }
     );
   };
 
@@ -1349,6 +1343,27 @@ export default function ProductsPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Products ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while analyzing products.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div
@@ -1365,7 +1380,7 @@ export function ErrorBoundary() {
           Unable to load product intelligence
         </div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while analyzing products."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

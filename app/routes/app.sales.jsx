@@ -137,10 +137,7 @@ export default function SalesPage() {
   const handleSyncData = () => {
     syncFetcher.submit(
       { intent: "sync_sales", days: String(periodDates.days || 30), shop: shop || "" },
-      {
-        method: "POST",
-        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
-      }
+      { method: "POST" }
     );
   };
 
@@ -148,10 +145,7 @@ export default function SalesPage() {
     setDismissedAnomalies((prev) => [...prev, id]);
     dismissFetcher.submit(
       { intent: "dismiss_anomaly", anomalyId: id, shop: shop || "" },
-      {
-        method: "POST",
-        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
-      }
+      { method: "POST" }
     );
   };
 
@@ -936,6 +930,27 @@ export default function SalesPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Sales ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while loading sales analytics.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div
@@ -952,7 +967,7 @@ export function ErrorBoundary() {
           Unable to load sales data
         </div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while loading sales analytics."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

@@ -10,6 +10,15 @@ export const loader = async ({ request }) => {
   return { apiKey: process.env.SHOPIFY_API_KEY || "" };
 };
 
+export const action = async (args) => {
+  // If any form or fetcher submits to /app, safely delegate to index action
+  const { action: indexAction } = await import("./app._index.jsx");
+  if (indexAction) {
+    return indexAction(args);
+  }
+  return { success: false, error: "No action handler available." };
+};
+
 export default function App() {
   const { apiKey } = useLoaderData();
 

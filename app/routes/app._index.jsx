@@ -59,7 +59,18 @@ export const loader = async ({ request }) => {
   } catch (err) {
     console.warn("Failed to fetch orders for dashboard:", err.message);
   }
-  const salesAnalytics = computeSalesAnalytics(orders, periodDates);
+  let salesAnalytics;
+  try {
+    salesAnalytics = computeSalesAnalytics(orders, periodDates);
+  } catch (analyticsErr) {
+    console.warn("Failed to compute sales analytics:", analyticsErr.message);
+    salesAnalytics = {
+      kpi: { grossSales: 0, netSales: 0, orders: 0, unitsSold: 0, avgOrderValue: 0, returnsCount: 0, revenueGrowth: 0, ordersGrowth: 0 },
+      trendRows: [],
+      summary: { totalDays: 30, peakDay: { day: "-", sales: 0 }, lowestDay: { day: "-", sales: 0 }, avgDailySales: 0 },
+      anomalies: [],
+    };
+  }
 
   // 2. Fetch Catalog Snapshot
   let catalog = [];
@@ -168,7 +179,12 @@ export const loader = async ({ request }) => {
   }
 
   // Background sync metadata
-  const syncStatus = await getStoreSyncStatus(shop);
+  let syncStatus = null;
+  try {
+    syncStatus = await getStoreSyncStatus(shop);
+  } catch (err) {
+    console.warn("Failed to get sync status for dashboard:", err.message);
+  }
 
   return {
     shop,
@@ -466,6 +482,10 @@ export default function OverviewPage() {
       if (actionFetcher.data.speedAudit?.themeId) {
         setSelectedThemeId(actionFetcher.data.speedAudit.themeId);
       }
+      // If bulk fix or rescan completed, clear local dismissals to show freshly loaded state
+      if (actionFetcher.data.message?.includes("critical") || actionFetcher.data.message?.includes("Diagnostic scan")) {
+        setDismissedProblems(new Set());
+      }
     }
   }, [actionFetcher.data]);
 
@@ -519,7 +539,6 @@ export default function OverviewPage() {
       { shop: shop || "", ...payload },
       {
         method: "POST",
-        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
       }
     );
   };
@@ -569,16 +588,16 @@ export default function OverviewPage() {
   };
 
   const isScanning =
-    actionFetcher.state === "submitting" &&
+    actionFetcher.state !== "idle" &&
     actionFetcher.formData?.get("intent") === "rescan";
   const isSyncing =
-    actionFetcher.state === "submitting" &&
+    actionFetcher.state !== "idle" &&
     actionFetcher.formData?.get("intent") === "sync_all";
   const isBulkFixing =
-    actionFetcher.state === "submitting" &&
+    actionFetcher.state !== "idle" &&
     actionFetcher.formData?.get("intent") === "bulk_fix_critical";
   const isTestingSpeed =
-    actionFetcher.state === "submitting" &&
+    actionFetcher.state !== "idle" &&
     actionFetcher.formData?.get("intent") === "test_theme_speed";
 
   const visibleProblems = topProblems.filter((p) => !dismissedProblems.has(p.id));
@@ -1327,7 +1346,7 @@ export default function OverviewPage() {
                   const fixClass = prob.fixType === "APP_FIX" ? "app-fix" : "dev-fix";
                   const isAppFix = prob.fixType === "APP_FIX";
                   const isThisFixing =
-                    actionFetcher.state === "submitting" &&
+                    actionFetcher.state !== "idle" &&
                     actionFetcher.formData?.get("problemId") === prob.id;
 
                   return (
@@ -1410,6 +1429,27 @@ export default function OverviewPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Dashboard ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while fetching analytics.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div
@@ -1423,10 +1463,10 @@ export function ErrorBoundary() {
       >
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>
-          Unable to load dashboard
+          Dashboard Diagnostics Notice
         </div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while fetching analytics."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

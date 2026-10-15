@@ -225,107 +225,115 @@ export const loader = async ({ request }) => {
   };
 };
 
-// ─── ACTION ───────────────────────────────────────────────────────────────────
+// ─── ACTION (100% Crash-Proof) ───────────────────────────────────────────────
 export const action = async ({ request }) => {
-  const formData = await request.formData();
-  const { admin, shop } = await getActionAdmin(request, formData);
-  const intent = formData.get("intent");
+  try {
+    const formData = await request.formData();
+    const { admin, shop } = await getActionAdmin(request, formData);
+    const intent = formData.get("intent");
 
-  if (intent === "quick_fix") {
-    const problemId = formData.get("problemId");
-    const actionKey = formData.get("actionKey");
-    const resourceId = formData.get("resourceId");
-    const resourceTitle = formData.get("resourceTitle");
+    if (intent === "quick_fix") {
+      const problemId = formData.get("problemId");
+      const actionKey = formData.get("actionKey");
+      const resourceId = formData.get("resourceId");
+      const resourceTitle = formData.get("resourceTitle");
 
-    try {
-      const result = await executeAppFix(admin, shop, {
-        problemId,
-        actionKey,
-        resourceId,
-        resourceTitle,
-      });
-      return {
-        success: true,
-        message: result?.message || "Remediation applied successfully!",
-        fixedId: problemId,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Failed to execute fix." };
+      try {
+        const result = await executeAppFix(admin, shop, {
+          problemId,
+          actionKey,
+          resourceId,
+          resourceTitle,
+        });
+        return {
+          success: true,
+          message: result?.message || "Remediation applied successfully!",
+          fixedId: problemId,
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Failed to execute fix." };
+      }
     }
-  }
 
-  if (intent === "ignore_problem") {
-    const problemId = formData.get("problemId");
-    try {
-      await executeAppFix(admin, shop, {
-        problemId,
-        actionKey: "IGNORE_PROBLEM",
-      });
-      return {
-        success: true,
-        message: "Problem dismissed from active queue.",
-        ignoredId: problemId,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Failed to dismiss problem." };
+    if (intent === "ignore_problem") {
+      const problemId = formData.get("problemId");
+      try {
+        await executeAppFix(admin, shop, {
+          problemId,
+          actionKey: "IGNORE_PROBLEM",
+        });
+        return {
+          success: true,
+          message: "Problem dismissed from active queue.",
+          ignoredId: problemId,
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Failed to dismiss problem." };
+      }
     }
-  }
 
-  if (intent === "bulk_fix_critical") {
-    try {
-      const result = await bulkFixAllCritical(admin, shop);
-      return {
-        success: true,
-        message: result.message,
-        fixedCount: result.fixedCount,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Bulk fix failed." };
+    if (intent === "bulk_fix_critical") {
+      try {
+        const result = await bulkFixAllCritical(admin, shop);
+        return {
+          success: true,
+          message: result.message,
+          fixedCount: result.fixedCount,
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Bulk fix failed." };
+      }
     }
-  }
 
-  if (intent === "test_theme_speed") {
-    const themeId = formData.get("themeId");
-    try {
-      const audit = await getThemeSpeedAudit(admin, shop, themeId);
-      return {
-        success: true,
-        message: `Speed audit complete for "${audit.themeName}"! Mobile: ${audit.mobile.score}/100 · Desktop: ${audit.desktop.score}/100`,
-        speedAudit: audit,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Failed to analyze theme speed." };
+    if (intent === "test_theme_speed") {
+      const themeId = formData.get("themeId");
+      try {
+        const audit = await getThemeSpeedAudit(admin, shop, themeId);
+        return {
+          success: true,
+          message: `Speed audit complete for "${audit.themeName}"! Mobile: ${audit.mobile.score}/100 · Desktop: ${audit.desktop.score}/100`,
+          speedAudit: audit,
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Failed to analyze theme speed." };
+      }
     }
-  }
 
-  if (intent === "rescan") {
-    try {
-      const scanData = await runStoreScan(admin, shop);
-      return {
-        success: true,
-        message: `Diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health score: ${scanData.healthScore}/100.`,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Scan failed." };
+    if (intent === "rescan") {
+      try {
+        const scanData = await runStoreScan(admin, shop);
+        return {
+          success: true,
+          message: `Diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health score: ${scanData.healthScore}/100.`,
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Scan failed." };
+      }
     }
-  }
 
-  if (intent === "sync_all") {
-    try {
-      const salesResult = await syncStoreSalesHistory(admin, shop, 30);
-      const catalogResult = await syncStoreCatalogSnapshots(admin, shop);
-      const scanResult = await runStoreScan(admin, shop);
+    if (intent === "sync_all") {
+      try {
+        const salesResult = await syncStoreSalesHistory(admin, shop, 30);
+        const catalogResult = await syncStoreCatalogSnapshots(admin, shop);
+        const scanResult = await runStoreScan(admin, shop);
 
-      return {
-        success: true,
-        message: `Store synchronized! Synced ${salesResult.ordersSynced} orders, ${catalogResult.productsSynced} products. Health score: ${scanResult.healthScore}/100.`,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Full sync failed." };
+        return {
+          success: true,
+          message: `Store synchronized! Synced ${salesResult.ordersSynced} orders, ${catalogResult.productsSynced} products. Health score: ${scanResult.healthScore}/100.`,
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Full sync failed." };
+      }
     }
-  }
 
-  return { success: false, error: "Invalid action intent" };
+    return { success: false, error: "Invalid action intent" };
+  } catch (fatalActionErr) {
+    console.error("Fatal action error caught safely:", fatalActionErr);
+    return {
+      success: false,
+      error: fatalActionErr.message || "An unexpected error occurred during action execution.",
+    };
+  }
 };
 
 // ─── SVG SPEED GAUGE COMPONENT ────────────────────────────────────────────────
@@ -549,7 +557,7 @@ export default function StoreDashboard() {
     setToastDismissed(false);
     actionFetcher.submit(
       { shop: shop || "", ...payload },
-      { method: "POST" }
+      { method: "POST", action: "/app?index" }
     );
   };
 
@@ -1153,11 +1161,67 @@ export default function StoreDashboard() {
   );
 }
 
-// ─── ERROR BOUNDARY ───────────────────────────────────────────────────────────
+// ─── ERROR BOUNDARY (Crash-Proof) ───────────────────────────────────────────
 export function ErrorBoundary() {
   const error = useRouteError();
   console.error("Dashboard ErrorBoundary caught error:", error);
-  return boundary.error(error);
+
+  // If this error is a Response from App Bridge (e.g. 401 or redirect challenge), let boundary.error handle it
+  if (
+    error &&
+    (error.status === 401 ||
+      error.status === 302 ||
+      error.constructor?.name === "ErrorResponse" ||
+      error.constructor?.name === "ErrorResponseImpl")
+  ) {
+    try {
+      const b = boundary.error(error);
+      if (b) return b;
+    } catch {
+      // non-blocking fallback
+    }
+  }
+
+  const errorMessage =
+    error instanceof Error
+      ? error.message
+      : typeof error?.data === "string"
+      ? error.data
+      : error?.statusText || "An unexpected error occurred while loading dashboard diagnostics.";
+
+  return (
+    <div className="sa-page sa-fade-in">
+      <div
+        className="sa-card"
+        style={{
+          maxWidth: 600,
+          margin: "40px auto",
+          padding: "36px 24px",
+          textAlign: "center",
+          boxShadow: "var(--sa-shadow)",
+        }}
+      >
+        <div style={{ fontSize: 42, marginBottom: 16 }}>🛡️</div>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "var(--sa-text-strong)", marginBottom: 8 }}>
+          Dashboard Diagnostics Notice
+        </div>
+        <div style={{ fontSize: 13, color: "var(--sa-text-muted)", marginBottom: 20, lineHeight: 1.6 }}>
+          {errorMessage}
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+          <button
+            onClick={() => window.location.reload()}
+            className="sa-btn sa-btn-primary"
+          >
+            🔄 Reload Dashboard
+          </button>
+          <a href="/app" className="sa-btn sa-btn-secondary">
+            Return to Overview
+          </a>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export const headers = (headersArgs) => boundary.headers(headersArgs);

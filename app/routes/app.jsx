@@ -11,12 +11,16 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async (args) => {
-  // If any form or fetcher submits to /app, safely delegate to index action
-  const { action: indexAction } = await import("./app._index.jsx");
-  if (indexAction) {
-    return indexAction(args);
+  try {
+    const { action: indexAction } = await import("./app._index.jsx");
+    if (indexAction) {
+      return await indexAction(args);
+    }
+    return { success: false, error: "No action handler available." };
+  } catch (err) {
+    console.error("Action error caught in app.jsx:", err);
+    return { success: false, error: err.message || "Failed to process request." };
   }
-  return { success: false, error: "No action handler available." };
 };
 
 export default function App() {
@@ -45,7 +49,57 @@ export default function App() {
 }
 
 export function ErrorBoundary() {
-  return boundary.error(useRouteError());
+  const error = useRouteError();
+  console.error("App Root ErrorBoundary caught error:", error);
+
+  if (
+    error &&
+    (error.status === 401 ||
+      error.status === 302 ||
+      error.constructor?.name === "ErrorResponse" ||
+      error.constructor?.name === "ErrorResponseImpl")
+  ) {
+    try {
+      const b = boundary.error(error);
+      if (b) return b;
+    } catch {}
+  }
+
+  const errorMessage =
+    error instanceof Error
+      ? error.message
+      : typeof error?.data === "string"
+      ? error.data
+      : error?.statusText || "An unexpected error occurred.";
+
+  return (
+    <div className="sa-page sa-fade-in">
+      <div
+        className="sa-card"
+        style={{
+          maxWidth: 600,
+          margin: "40px auto",
+          padding: "36px 24px",
+          textAlign: "center",
+          boxShadow: "var(--sa-shadow)",
+        }}
+      >
+        <div style={{ fontSize: 42, marginBottom: 16 }}>🛡️</div>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "var(--sa-text-strong)", marginBottom: 8 }}>
+          Application Notice
+        </div>
+        <div style={{ fontSize: 13, color: "var(--sa-text-muted)", marginBottom: 20, lineHeight: 1.6 }}>
+          {errorMessage}
+        </div>
+        <button
+          onClick={() => window.location.reload()}
+          className="sa-btn sa-btn-primary"
+        >
+          🔄 Reload Application
+        </button>
+      </div>
+    </div>
+  );
 }
 
 export const headers = (headersArgs) => {

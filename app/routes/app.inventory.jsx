@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useSearchParams, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import {
   getPeriodDates,
   fetchStoreOrders,
@@ -51,8 +53,8 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "quick_restock") {
@@ -61,7 +63,7 @@ export const action = async ({ request }) => {
     const delta = formData.get("delta") || "10";
 
     try {
-      const result = await executeAppFix(admin, session.shop, {
+      const result = await executeAppFix(admin, shop, {
         actionKey: "ADJUST_INVENTORY",
         resourceId,
         resourceTitle,
@@ -83,7 +85,7 @@ export const action = async ({ request }) => {
     const targetStatus = formData.get("targetStatus") || "DRAFT";
 
     try {
-      const result = await executeAppFix(admin, session.shop, {
+      const result = await executeAppFix(admin, shop, {
         actionKey: "SET_STATUS",
         resourceId,
         resourceTitle,
@@ -125,8 +127,12 @@ export default function InventoryPage() {
         resourceId: item.id,
         resourceTitle: item.title,
         delta: delta.toString(),
+        shop: shop || "",
       },
-      { method: "POST" }
+      {
+        method: "POST",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
     );
   };
 
@@ -137,8 +143,12 @@ export default function InventoryPage() {
         resourceId: item.id,
         resourceTitle: item.title,
         targetStatus,
+        shop: shop || "",
       },
-      { method: "POST" }
+      {
+        method: "POST",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
     );
   };
 
@@ -306,9 +316,9 @@ export default function InventoryPage() {
                               {isThisRestocking ? "Restocking..." : "⚡ +10 Restock"}
                             </button>
                             <a
-                              href={shop ? `https://${shop}/admin/products/${item.id.split("/").pop()}` : `https://admin.shopify.com/store`}
+                              href={getShopifyAdminUrl(shop, "products", item.id)}
                               target="_blank"
-                              rel="noreferrer"
+                              rel="noopener noreferrer"
                               className="sa-btn sa-btn-ghost"
                               style={{ padding: "4px 8px", fontSize: 11 }}
                             >
@@ -384,9 +394,9 @@ export default function InventoryPage() {
                               {isThisDrafting ? "Drafting..." : "💤 Set to Draft"}
                             </button>
                             <a
-                              href={shop ? `https://${shop}/admin/products/${item.id.split("/").pop()}` : `https://admin.shopify.com/store`}
+                              href={getShopifyAdminUrl(shop, "products", item.id)}
                               target="_blank"
-                              rel="noreferrer"
+                              rel="noopener noreferrer"
                               className="sa-btn sa-btn-ghost"
                               style={{ padding: "4px 8px", fontSize: 11 }}
                             >

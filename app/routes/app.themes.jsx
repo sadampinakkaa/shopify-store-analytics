@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
 import { getStoreThemes, scanTheme } from "../services/theme.server";
 
 export const loader = async ({ request }) => {
@@ -27,6 +28,7 @@ export const loader = async ({ request }) => {
   }
 
   return {
+    shop,
     themes,
     defaultThemeId: defaultTheme?.shopifyId || "",
     initialScan,
@@ -34,8 +36,8 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const themeId = formData.get("themeId");
 
   if (!themeId) {
@@ -43,7 +45,7 @@ export const action = async ({ request }) => {
   }
 
   try {
-    const scanResult = await scanTheme(admin, session.shop, themeId);
+    const scanResult = await scanTheme(admin, shop, themeId);
     return { success: true, scanResult };
   } catch (err) {
     return { success: false, error: err.message };
@@ -51,7 +53,7 @@ export const action = async ({ request }) => {
 };
 
 export default function ThemesPage() {
-  const { themes, defaultThemeId, initialScan } = useLoaderData();
+  const { shop, themes, defaultThemeId, initialScan } = useLoaderData();
   const fetcher = useFetcher();
 
   const [selectedThemeId, setSelectedThemeId] = useState(defaultThemeId);
@@ -64,7 +66,13 @@ export default function ThemesPage() {
   const isScanning = fetcher.state !== "idle";
 
   const handleScanTheme = () => {
-    fetcher.submit({ themeId: selectedThemeId }, { method: "post" });
+    fetcher.submit(
+      { themeId: selectedThemeId, shop: shop || "" },
+      {
+        method: "post",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
+    );
   };
 
   const getScoreColor = (score) => {

@@ -78,7 +78,8 @@ export async function runStoreScan(admin, shop) {
 
   for (const p of products) {
     const shopifyNumericId = p.id.split("/").pop();
-    const adminUrl = `https://${shop}/admin/products/${shopifyNumericId}`;
+    const storeHandle = shop ? shop.replace(".myshopify.com", "") : "admin";
+    const adminUrl = `https://admin.shopify.com/store/${storeHandle}/products/${shopifyNumericId}`;
     const inv = p.totalInventory ?? 0;
     const mediaCount = p.media?.edges?.length ?? 0;
     const variants = p.variants?.edges?.map((ve) => ve.node) ?? [];
@@ -103,13 +104,14 @@ export async function runStoreScan(admin, shop) {
       });
     }
 
-    // ── 2. CRITICAL: Active Product Without Media [Dev Fix] ───────────────────
+    // ── 2. CRITICAL: Active Product Without Media [App Fix: Draft to protect trust] ──
     if (mediaCount === 0) {
       detectedProblems.push({
         id: `no-media-${shopifyNumericId}`,
         shop,
         severity: "CRITICAL",
-        fixType: "DEV_FIX",
+        fixType: "APP_FIX",
+        actionKey: "FIX_OUT_OF_STOCK",
         category: "product",
         title: "Active Product Missing Images",
         description: `"${p.title}" has no media or product photography attached.`,
@@ -122,7 +124,7 @@ export async function runStoreScan(admin, shop) {
       });
     }
 
-    // ── 3. CRITICAL: $0.00 Price on Active Variant [Dev Fix] ──────────────────
+    // ── 3. CRITICAL: $0.00 Price on Active Variant [App Fix: Draft $0 product] ───
     for (const v of variants) {
       const price = parseFloat(v.price || "0");
       if (price === 0) {
@@ -131,7 +133,8 @@ export async function runStoreScan(admin, shop) {
           id: `zero-price-${variantNumericId}`,
           shop,
           severity: "CRITICAL",
-          fixType: "DEV_FIX",
+          fixType: "APP_FIX",
+          actionKey: "FIX_ZERO_PRICE",
           category: "product",
           title: "$0.00 Variant Price Error",
           description: `Variant "${v.title}" of "${p.title}" is listed for $0.00.`,
@@ -145,14 +148,15 @@ export async function runStoreScan(admin, shop) {
       }
     }
 
-    // ── 4. WARNING: Missing Barcode or SKU [Dev Fix] ──────────────────────────
+    // ── 4. WARNING: Missing Barcode or SKU [App Fix: Auto-assign SKU] ────────────
     const missingSkuVariants = variants.filter((v) => !v.sku && !v.barcode);
     if (missingSkuVariants.length > 0) {
       detectedProblems.push({
         id: `missing-sku-${shopifyNumericId}`,
         shop,
         severity: "WARNING",
-        fixType: "DEV_FIX",
+        fixType: "APP_FIX",
+        actionKey: "FIX_MISSING_SKU",
         category: "inventory",
         title: "Missing SKU / Barcode Identifier",
         description: `"${p.title}" has ${missingSkuVariants.length} variant(s) without an inventory SKU or barcode.`,
@@ -165,18 +169,19 @@ export async function runStoreScan(admin, shop) {
       });
     }
 
-    // ── 5. WARNING: Missing Product Description [Manual / Dev Fix] ───────────
+    // ── 5. WARNING: Missing Product Description [App Fix: Auto-generate rich copy] ─
     const desc = p.descriptionHtml ? p.descriptionHtml.replace(/<[^>]*>/g, "").trim() : "";
     if (!desc || desc.length < 20) {
       detectedProblems.push({
         id: `missing-desc-${shopifyNumericId}`,
         shop,
         severity: "WARNING",
-        fixType: "DEV_FIX",
+        fixType: "APP_FIX",
+        actionKey: "FIX_MISSING_DESCRIPTION",
         category: "product",
         title: "Missing Product Description",
         description: `"${p.title}" has an empty or very brief description (${desc.length} characters).`,
-        whyItMatters: "Thin content reduces on-page engagement, increases return rates, and hurts search engine ranking. Add tailored copy in Shopify Admin.",
+        whyItMatters: "Thin content reduces on-page engagement, increases return rates, and hurts search engine ranking.",
         resourceId: p.id,
         resourceType: "Product",
         resourceUrl: adminUrl,
@@ -185,7 +190,7 @@ export async function runStoreScan(admin, shop) {
       });
     }
 
-    // ── 6. WARNING: Missing SEO Metadata [App Fix] ───────────────────────────
+    // ── 6. WARNING: Missing SEO Metadata [App Fix: Auto-generate SEO tags] ────────
     const hasSeoTitle = Boolean(p.seo?.title && p.seo.title.trim().length > 0);
     const hasSeoDesc = Boolean(p.seo?.description && p.seo.description.trim().length > 0);
     if (!hasSeoTitle || !hasSeoDesc) {
@@ -207,13 +212,14 @@ export async function runStoreScan(admin, shop) {
       });
     }
 
-    // ── 7. NOTICE: Low Stock Warning [Dev Fix] ───────────────────────────────
+    // ── 7. NOTICE: Low Stock Warning [App Fix: Quick +10 Restock] ────────────────
     if (inv > 0 && inv <= 3) {
       detectedProblems.push({
         id: `low-stock-${shopifyNumericId}`,
         shop,
         severity: "NOTICE",
-        fixType: "DEV_FIX",
+        fixType: "APP_FIX",
+        actionKey: "ADJUST_INVENTORY",
         category: "inventory",
         title: "Critical Low Stock Threshold",
         description: `"${p.title}" only has ${inv} unit(s) remaining in stock.`,

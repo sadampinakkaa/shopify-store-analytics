@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
 import prisma from "../db.server";
 
 export const loader = async ({ request }) => {
@@ -23,14 +24,15 @@ export const loader = async ({ request }) => {
   const scansThisMonth = await prisma.scan.count({ where: { shop } });
 
   return {
+    shop,
     sub,
     scansThisMonth,
   };
 };
 
 export const action = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "change_plan") {
@@ -38,7 +40,7 @@ export const action = async ({ request }) => {
     const limit = newPlan === "Enterprise" ? 1000 : newPlan === "Growth" ? 250 : 50;
 
     await prisma.subscription.update({
-      where: { shop: session.shop },
+      where: { shop },
       data: { plan: newPlan, scanLimit: limit },
     });
 
@@ -49,7 +51,7 @@ export const action = async ({ request }) => {
 };
 
 export default function SettingsPage() {
-  const { sub, scansThisMonth } = useLoaderData();
+  const { shop, sub, scansThisMonth } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activePlan, setActivePlan] = useState(sub.plan);
@@ -58,7 +60,13 @@ export default function SettingsPage() {
 
   const handleSelectPlan = (plan) => {
     setActivePlan(plan);
-    fetcher.submit({ intent: "change_plan", plan }, { method: "post" });
+    fetcher.submit(
+      { intent: "change_plan", plan, shop: shop || "" },
+      {
+        method: "post",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
+    );
   };
 
   const plans = [

@@ -2,6 +2,8 @@ import { useState, useMemo } from "react";
 import { useLoaderData, useFetcher, useSearchParams, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import {
   getPeriodDates,
   fetchStoreOrders,
@@ -53,11 +55,11 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
-  if (intent === "product_fix") {
+  if (intent === "product_fix" || intent === "app_fix") {
     const actionKey = formData.get("actionKey");
     const resourceId = formData.get("resourceId");
     const resourceTitle = formData.get("resourceTitle");
@@ -65,7 +67,7 @@ export const action = async ({ request }) => {
     const targetStatus = formData.get("targetStatus");
 
     try {
-      const result = await executeAppFix(admin, session.shop, {
+      const result = await executeAppFix(admin, shop, {
         actionKey,
         resourceId,
         resourceTitle,
@@ -84,7 +86,7 @@ export const action = async ({ request }) => {
 
   if (intent === "sync_catalog") {
     try {
-      const result = await syncStoreCatalogSnapshots(admin, session.shop);
+      const result = await syncStoreCatalogSnapshots(admin, shop);
       return {
         success: true,
         message: `Catalog synchronized: cached ${result.productsSynced} product snapshots in database.`,
@@ -96,7 +98,7 @@ export const action = async ({ request }) => {
 
   if (intent === "bulk_fix_stockout") {
     try {
-      const result = await bulkFixAllCritical(admin, session.shop);
+      const result = await bulkFixAllCritical(admin, shop);
       return {
         success: true,
         message: result.message,
@@ -108,7 +110,7 @@ export const action = async ({ request }) => {
 
   if (intent === "bulk_fix_seo") {
     try {
-      const result = await bulkFixSeo(admin, session.shop);
+      const result = await bulkFixSeo(admin, shop);
       return {
         success: true,
         message: result.message,
@@ -152,7 +154,13 @@ export default function ProductsPage() {
   };
 
   const handleSyncCatalog = () => {
-    syncFetcher.submit({ intent: "sync_catalog" }, { method: "POST" });
+    syncFetcher.submit(
+      { intent: "sync_catalog", shop: shop || "" },
+      {
+        method: "POST",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
+    );
   };
 
   const getStatusBadgeClass = (status) => {
@@ -280,9 +288,13 @@ export default function ProductsPage() {
         actionKey,
         resourceId: product.id,
         resourceTitle: product.title,
+        shop: shop || "",
         ...extra,
       },
-      { method: "POST" }
+      {
+        method: "POST",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
     );
   };
 
@@ -852,9 +864,9 @@ export default function ProductsPage() {
                       <td className="muted">{p.lastSoldAt ? p.lastSoldAt.slice(0, 10) : "Never"}</td>
                       <td>
                         <a
-                          href={`https://${shop}/admin/products/${p.id.split("/").pop()}`}
+                          href={getShopifyAdminUrl(shop, "products", p.id)}
                           target="_blank"
-                          rel="noreferrer"
+                          rel="noopener noreferrer"
                           className="sa-btn sa-btn-secondary"
                           style={{ padding: "3px 8px", fontSize: 11 }}
                           onClick={(e) => e.stopPropagation()}
@@ -1318,9 +1330,9 @@ export default function ProductsPage() {
                 </div>
 
                 <a
-                  href={shop ? `https://${shop}/admin/products/${selectedProduct.id.split("/").pop()}` : "#"}
+                  href={getShopifyAdminUrl(shop, "products", selectedProduct?.id)}
                   target="_blank"
-                  rel="noreferrer"
+                  rel="noopener noreferrer"
                   className="sa-btn sa-btn-primary"
                   style={{ fontSize: 11 }}
                 >

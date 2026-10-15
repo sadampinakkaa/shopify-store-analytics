@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { executeAppFix } from "../app/services/fixes.server.js";
 import { getThemeSpeedAudit } from "../app/services/performance.server.js";
+import { getShopifyAdminUrl } from "../app/services/auth.server.js";
 
 describe("Universal 1-Click Fix Engine", () => {
   it("executes FIX_OUT_OF_STOCK and drafts product safely", async () => {
@@ -216,5 +217,27 @@ describe("Theme-wise Site Speed Engine", () => {
     assert.ok(audit.desktop.inp > 0);
     assert.ok(audit.bottlenecks.length > 0);
     assert.ok(audit.bottlenecks.some((b) => b.title.includes("JavaScript") || b.title.includes("Image")));
+  });
+});
+
+describe("Direct Shopify Admin Navigation & Safe URLs", () => {
+  it("formats direct modern admin.shopify.com URLs without 302 redirects", () => {
+    const url = getShopifyAdminUrl("my-boutique.myshopify.com", "products", "gid://shopify/Product/12345678");
+    assert.equal(url, "https://admin.shopify.com/store/my-boutique/products/12345678");
+  });
+
+  it("handles raw numeric IDs and cleans string characters", () => {
+    const url = getShopifyAdminUrl("fresh-look.myshopify.com", "products", "987654321");
+    assert.equal(url, "https://admin.shopify.com/store/fresh-look/products/987654321");
+  });
+
+  it("falls back to resource collection URL when id is absent", () => {
+    const url = getShopifyAdminUrl("fresh-look.myshopify.com", "products", "");
+    assert.equal(url, "https://admin.shopify.com/store/fresh-look/products");
+  });
+
+  it("returns '#' safely if shop is missing", () => {
+    const url = getShopifyAdminUrl("", "products", "123");
+    assert.equal(url, "#");
   });
 });

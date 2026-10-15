@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { useLoaderData, useFetcher, useSearchParams, useRouteError, Link } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import {
   getPeriodDates,
   fetchStoreOrders,
@@ -200,8 +202,8 @@ export const loader = async ({ request }) => {
 
 // ─── ACTION ───────────────────────────────────────────────────────────────────
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "quick_fix") {
@@ -211,7 +213,7 @@ export const action = async ({ request }) => {
     const resourceTitle = formData.get("resourceTitle");
 
     try {
-      const result = await executeAppFix(admin, session.shop, {
+      const result = await executeAppFix(admin, shop, {
         problemId,
         actionKey,
         resourceId,
@@ -230,7 +232,7 @@ export const action = async ({ request }) => {
   if (intent === "ignore_problem") {
     const problemId = formData.get("problemId");
     try {
-      await executeAppFix(admin, session.shop, {
+      await executeAppFix(admin, shop, {
         problemId,
         actionKey: "IGNORE_PROBLEM",
       });
@@ -246,7 +248,7 @@ export const action = async ({ request }) => {
 
   if (intent === "bulk_fix_critical") {
     try {
-      const result = await bulkFixAllCritical(admin, session.shop);
+      const result = await bulkFixAllCritical(admin, shop);
       return {
         success: true,
         message: result.message,
@@ -259,7 +261,7 @@ export const action = async ({ request }) => {
   if (intent === "test_theme_speed") {
     const themeId = formData.get("themeId");
     try {
-      const audit = await getThemeSpeedAudit(admin, session.shop, themeId);
+      const audit = await getThemeSpeedAudit(admin, shop, themeId);
       return {
         success: true,
         message: `Speed audit complete for "${audit.themeName}"! Mobile: ${audit.mobile.score}/100 · Desktop: ${audit.desktop.score}/100`,
@@ -272,7 +274,7 @@ export const action = async ({ request }) => {
 
   if (intent === "rescan") {
     try {
-      const scanData = await runStoreScan(admin, session.shop);
+      const scanData = await runStoreScan(admin, shop);
       return {
         success: true,
         message: `Diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health score: ${scanData.healthScore}/100.`,
@@ -284,9 +286,9 @@ export const action = async ({ request }) => {
 
   if (intent === "sync_all") {
     try {
-      const salesResult = await syncStoreSalesHistory(admin, session.shop, 30);
-      const catalogResult = await syncStoreCatalogSnapshots(admin, session.shop);
-      const scanResult = await runStoreScan(admin, session.shop);
+      const salesResult = await syncStoreSalesHistory(admin, shop, 30);
+      const catalogResult = await syncStoreCatalogSnapshots(admin, shop);
+      const scanResult = await runStoreScan(admin, shop);
 
       return {
         success: true,
@@ -512,6 +514,16 @@ export default function OverviewPage() {
     });
   };
 
+  const submitAction = (payload) => {
+    actionFetcher.submit(
+      { shop: shop || "", ...payload },
+      {
+        method: "POST",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
+    );
+  };
+
   const handleThemeChange = (newThemeId) => {
     setSelectedThemeId(newThemeId);
     setSearchParams((prev) => {
@@ -520,52 +532,40 @@ export default function OverviewPage() {
       return next;
     });
     // Trigger on-demand speed audit for selected theme
-    actionFetcher.submit(
-      { intent: "test_theme_speed", themeId: newThemeId },
-      { method: "POST" }
-    );
+    submitAction({ intent: "test_theme_speed", themeId: newThemeId });
   };
 
   const handleRunSpeedTest = () => {
-    actionFetcher.submit(
-      { intent: "test_theme_speed", themeId: selectedThemeId },
-      { method: "POST" }
-    );
+    submitAction({ intent: "test_theme_speed", themeId: selectedThemeId });
   };
 
   const handleRunScan = () => {
-    actionFetcher.submit({ intent: "rescan" }, { method: "POST" });
+    submitAction({ intent: "rescan" });
   };
 
   const handleSyncAll = () => {
-    actionFetcher.submit({ intent: "sync_all" }, { method: "POST" });
+    submitAction({ intent: "sync_all" });
   };
 
   const handleBulkFixCritical = () => {
-    actionFetcher.submit({ intent: "bulk_fix_critical" }, { method: "POST" });
+    submitAction({ intent: "bulk_fix_critical" });
   };
 
   const handleQuickFix = (problem) => {
-    actionFetcher.submit(
-      {
-        intent: "quick_fix",
-        problemId: problem.id,
-        actionKey: problem.actionKey || "",
-        resourceId: problem.resourceId || "",
-        resourceTitle: problem.resourceTitle || problem.title,
-      },
-      { method: "POST" }
-    );
+    submitAction({
+      intent: "quick_fix",
+      problemId: problem.id,
+      actionKey: problem.actionKey || "",
+      resourceId: problem.resourceId || "",
+      resourceTitle: problem.resourceTitle || problem.title,
+    });
   };
 
   const handleIgnoreProblem = (problemId) => {
-    actionFetcher.submit(
-      {
-        intent: "ignore_problem",
-        problemId,
-      },
-      { method: "POST" }
-    );
+    submitAction({
+      intent: "ignore_problem",
+      problemId,
+    });
   };
 
   const isScanning =
@@ -1375,11 +1375,11 @@ export default function OverviewPage() {
                           >
                             Dismiss
                           </button>
-                          {prob.resourceUrl && (
+                          {(prob.resourceId || prob.resourceUrl) && (
                             <a
-                              href={prob.resourceUrl}
+                              href={getShopifyAdminUrl(shop, prob.resourceType || "products", prob.resourceId || prob.resourceUrl)}
                               target="_blank"
-                              rel="noreferrer"
+                              rel="noopener noreferrer"
                               className="sa-btn sa-btn-secondary"
                               style={{ padding: "3px 9px", fontSize: 11 }}
                             >

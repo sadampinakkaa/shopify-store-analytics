@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import { runStoreScan } from "../services/scanner.server";
 import { executeAppFix } from "../services/fixes.server";
 import prisma from "../db.server";
@@ -79,8 +81,8 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "app_fix") {
@@ -90,7 +92,7 @@ export const action = async ({ request }) => {
     const resourceTitle = formData.get("resourceTitle");
 
     try {
-      const result = await executeAppFix(admin, session.shop, {
+      const result = await executeAppFix(admin, shop, {
         problemId,
         actionKey,
         resourceId,
@@ -106,7 +108,7 @@ export const action = async ({ request }) => {
   if (intent === "ignore_problem") {
     const problemId = formData.get("problemId");
     try {
-      await executeAppFix(admin, session.shop, {
+      await executeAppFix(admin, shop, {
         problemId,
         actionKey: "IGNORE_PROBLEM",
       });
@@ -119,12 +121,12 @@ export const action = async ({ request }) => {
   if (intent === "bulk_fix") {
     try {
       const activeFixables = await prisma.problem.findMany({
-        where: { shop: session.shop, fixType: "APP_FIX", resolvedAt: null },
+        where: { shop, fixType: "APP_FIX", resolvedAt: null },
       });
       let count = 0;
       for (const prob of activeFixables) {
         try {
-          await executeAppFix(admin, session.shop, {
+          await executeAppFix(admin, shop, {
             problemId: prob.id,
             actionKey: prob.actionKey,
             resourceId: prob.resourceId,
@@ -135,7 +137,7 @@ export const action = async ({ request }) => {
           console.warn(`Bulk fix item failed for ${prob.id}:`, itemErr.message);
         }
       }
-      await runStoreScan(admin, session.shop);
+      await runStoreScan(admin, shop);
       return { success: true, message: `Successfully resolved ${count} issue(s) in 1-click!` };
     } catch (err) {
       return { success: false, error: err.message };
@@ -143,7 +145,7 @@ export const action = async ({ request }) => {
   }
 
   if (intent === "run_scan") {
-    const scanData = await runStoreScan(admin, session.shop);
+    const scanData = await runStoreScan(admin, shop);
     return { success: true, message: "Diagnostic scan completed successfully." };
   }
 
@@ -151,7 +153,7 @@ export const action = async ({ request }) => {
 };
 
 export default function ProblemsPage() {
-  const { problems, resolvedProblems = [], healthScore, stats, totalProductsScanned } = useLoaderData();
+  const { shop, problems, resolvedProblems = [], healthScore, stats, totalProductsScanned } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activeFilter, setActiveFilter] = useState("all"); // 'all' | 'critical' | 'warning' | 'notice' | 'app_fix' | 'resolved'
@@ -173,35 +175,39 @@ export default function ProblemsPage() {
     }
   }, [fetcher.data]);
 
-  const handleFix = (problem) => {
+  const submitAction = (payload) => {
     fetcher.submit(
+      { shop: shop || "", ...payload },
       {
-        intent: "app_fix",
-        problemId: problem.id,
-        actionKey: problem.actionKey || "",
-        resourceId: problem.resourceId || "",
-        resourceTitle: problem.resourceTitle || problem.title,
-      },
-      { method: "post" }
+        method: "post",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
     );
+  };
+
+  const handleFix = (problem) => {
+    submitAction({
+      intent: "app_fix",
+      problemId: problem.id,
+      actionKey: problem.actionKey || "",
+      resourceId: problem.resourceId || "",
+      resourceTitle: problem.resourceTitle || problem.title,
+    });
   };
 
   const handleIgnore = (problemId) => {
-    fetcher.submit(
-      {
-        intent: "ignore_problem",
-        problemId,
-      },
-      { method: "post" }
-    );
+    submitAction({
+      intent: "ignore_problem",
+      problemId,
+    });
   };
 
   const handleRunScan = () => {
-    fetcher.submit({ intent: "run_scan" }, { method: "post" });
+    submitAction({ intent: "run_scan" });
   };
 
   const handleBulkFix = () => {
-    fetcher.submit({ intent: "bulk_fix" }, { method: "post" });
+    submitAction({ intent: "bulk_fix" });
   };
 
   const appFixableCount = problems.filter((p) => p.fixType === "APP_FIX" && !fixedProblemIds.has(p.id)).length;
@@ -435,9 +441,9 @@ export default function ProblemsPage() {
                       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
                         <span className="sa-badge success">Remediated</span>
                         <a
-                          href={prob.resourceUrl}
+                          href={getShopifyAdminUrl(shop, prob.resourceType || "products", prob.resourceId || prob.resourceUrl)}
                           target="_blank"
-                          rel="noreferrer"
+                          rel="noopener noreferrer"
                           className="sa-btn sa-btn-ghost"
                           style={{ whiteSpace: "nowrap", fontSize: 12 }}
                         >
@@ -489,9 +495,9 @@ export default function ProblemsPage() {
                           Dismiss
                         </button>
                         <a
-                          href={prob.resourceUrl}
+                          href={getShopifyAdminUrl(shop, prob.resourceType || "products", prob.resourceId || prob.resourceUrl)}
                           target="_blank"
-                          rel="noreferrer"
+                          rel="noopener noreferrer"
                           className="sa-btn sa-btn-secondary"
                           style={{ whiteSpace: "nowrap" }}
                         >

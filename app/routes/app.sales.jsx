@@ -2,6 +2,7 @@ import { useState, useMemo } from "react";
 import { useLoaderData, useFetcher, useSearchParams, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
 import {
   getPeriodDates,
   fetchStoreOrders,
@@ -55,14 +56,14 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "sync_sales") {
     try {
       const days = parseInt(formData.get("days") || "30", 10);
-      const result = await syncStoreSalesHistory(admin, session.shop, days);
+      const result = await syncStoreSalesHistory(admin, shop, days);
       return {
         success: true,
         message: `Synced ${result.ordersSynced} orders across ${result.daysSynced} days into database snapshot.`,
@@ -135,14 +136,23 @@ export default function SalesPage() {
 
   const handleSyncData = () => {
     syncFetcher.submit(
-      { intent: "sync_sales", days: String(periodDates.days || 30) },
-      { method: "POST" }
+      { intent: "sync_sales", days: String(periodDates.days || 30), shop: shop || "" },
+      {
+        method: "POST",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
     );
   };
 
   const handleDismissAnomaly = (id) => {
     setDismissedAnomalies((prev) => [...prev, id]);
-    dismissFetcher.submit({ intent: "dismiss_anomaly", anomalyId: id }, { method: "POST" });
+    dismissFetcher.submit(
+      { intent: "dismiss_anomaly", anomalyId: id, shop: shop || "" },
+      {
+        method: "POST",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
+    );
   };
 
   // Filter and sort daily trend rows

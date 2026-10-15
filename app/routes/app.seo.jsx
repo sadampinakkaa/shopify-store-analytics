@@ -2,18 +2,22 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import { runSeoAudit, fixSeoSnippet } from "../services/seo.server";
 import { bulkFixSeo } from "../services/fixes.server";
 import prisma from "../db.server";
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
   try {
-    const audit = await runSeoAudit(admin, session.shop);
-    return audit;
+    const audit = await runSeoAudit(admin, shop);
+    return { shop, ...audit };
   } catch (err) {
     console.warn("SEO audit failed:", err?.message || err);
     return {
+      shop,
       seoScore: 100,
       stats: { total: 0, critical: 0, warning: 0, notice: 0, canFixCount: 0 },
       issues: [],
@@ -22,8 +26,8 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "fix_seo") {
@@ -36,7 +40,7 @@ export const action = async ({ request }) => {
         const numericId = productId.replace(/\D/g, "");
         await prisma.problem.updateMany({
           where: {
-            shop: session.shop,
+            shop,
             OR: [
               { resourceId: productId },
               { id: `missing-seo-${numericId}` },
@@ -55,7 +59,7 @@ export const action = async ({ request }) => {
 
   if (intent === "bulk_fix_seo") {
     try {
-      const result = await bulkFixSeo(admin, session.shop);
+      const result = await bulkFixSeo(admin, shop);
       return { success: true, message: result.message };
     } catch (err) {
       return { success: false, error: err.message || "Bulk SEO optimization failed." };
@@ -66,7 +70,7 @@ export const action = async ({ request }) => {
 };
 
 export default function SeoPage() {
-  const { seoScore, stats, issues } = useLoaderData();
+  const { shop, seoScore, stats, issues } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activeFilter, setActiveFilter] = useState("all");
@@ -79,13 +83,23 @@ export default function SeoPage() {
         intent: "fix_seo",
         productId: issue.resourceId,
         productTitle: issue.resourceTitle,
+        shop: shop || "",
       },
-      { method: "post" }
+      {
+        method: "post",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
     );
   };
 
   const handleBulkFixSeo = () => {
-    fetcher.submit({ intent: "bulk_fix_seo" }, { method: "post" });
+    fetcher.submit(
+      { intent: "bulk_fix_seo", shop: shop || "" },
+      {
+        method: "post",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
+    );
   };
 
   const filteredIssues = issues.filter((i) => {
@@ -287,9 +301,9 @@ export default function SeoPage() {
                       </button>
                     ) : (
                       <a
-                        href={issue.resourceUrl}
+                        href={getShopifyAdminUrl(shop, "products", issue.resourceId || issue.resourceUrl)}
                         target="_blank"
-                        rel="noreferrer"
+                        rel="noopener noreferrer"
                         className="sa-btn sa-btn-ghost"
                         style={{ whiteSpace: "nowrap" }}
                       >

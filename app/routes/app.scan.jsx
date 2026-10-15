@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
 import { runStoreScan } from "../services/scanner.server";
 import prisma from "../db.server";
 
@@ -34,6 +35,7 @@ export const loader = async ({ request }) => {
   }
 
   return {
+    shop,
     scans,
     auditLogs,
     stats: {
@@ -46,13 +48,13 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "trigger_scan") {
     try {
-      const scanData = await runStoreScan(admin, session.shop);
+      const scanData = await runStoreScan(admin, shop);
       return { success: true, message: `Diagnostic scan complete. Found ${scanData.stats.total} total findings.` };
     } catch (err) {
       return { success: false, error: err.message };
@@ -63,14 +65,20 @@ export const action = async ({ request }) => {
 };
 
 export default function ScanHistoryPage() {
-  const { scans, auditLogs, stats } = useLoaderData();
+  const { shop, scans, auditLogs, stats } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activeTab, setActiveTab] = useState("scans"); // 'scans' | 'audit'
   const isScanning = fetcher.state !== "idle";
 
   const handleTriggerScan = () => {
-    fetcher.submit({ intent: "trigger_scan" }, { method: "post" });
+    fetcher.submit(
+      { intent: "trigger_scan", shop: shop || "" },
+      {
+        method: "post",
+        action: typeof window !== "undefined" ? window.location.pathname + window.location.search : undefined,
+      }
+    );
   };
 
   return (

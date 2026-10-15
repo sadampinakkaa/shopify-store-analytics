@@ -37,6 +37,24 @@ export function ErrorBoundary() {
   const error = useRouteError();
   console.error("Root ErrorBoundary caught error:", error);
 
+  // If this is a Shopify App Bridge script (OAuth redirect / session approval), execute it immediately as HTML!
+  if (
+    typeof error?.data === "string" &&
+    (error.data.includes("<script") || error.data.includes("app-bridge"))
+  ) {
+    return (
+      <html lang="en">
+        <head>
+          <meta charSet="utf-8" />
+          <meta name="viewport" content="width=device-width,initial-scale=1" />
+        </head>
+        <body>
+          <div dangerouslySetInnerHTML={{ __html: error.data }} />
+        </body>
+      </html>
+    );
+  }
+
   const errorMessage =
     error instanceof Error
       ? error.message

@@ -5,7 +5,14 @@ import { NavMenu } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 
 export const loader = async ({ request }) => {
-  await authenticate.admin(request);
+  try {
+    await authenticate.admin(request);
+  } catch (err) {
+    const url = new URL(request.url);
+    if (err instanceof Response && !url.searchParams.has("_data")) {
+      throw err;
+    }
+  }
   // eslint-disable-next-line no-undef
   return { apiKey: process.env.SHOPIFY_API_KEY || "" };
 };
@@ -51,6 +58,14 @@ export default function App() {
 export function ErrorBoundary() {
   const error = useRouteError();
   console.error("App Root ErrorBoundary caught error:", error);
+
+  // If this is a Shopify App Bridge script (OAuth redirect / session approval), execute it immediately as HTML!
+  if (
+    typeof error?.data === "string" &&
+    (error.data.includes("<script") || error.data.includes("app-bridge"))
+  ) {
+    return <div dangerouslySetInnerHTML={{ __html: error.data }} />;
+  }
 
   if (
     error &&

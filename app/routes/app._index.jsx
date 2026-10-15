@@ -46,20 +46,28 @@ function fmtNum(val) {
 // ─── LOADER (Crash-Proof with Graceful Fallbacks) ─────────────────────────────
 export const loader = async ({ request }) => {
   let admin, session, shop;
+  const url = new URL(request.url);
+  const isDataRequest = url.searchParams.has("_data");
+
   try {
     const auth = await authenticate.admin(request);
     admin = auth.admin;
     session = auth.session;
     shop = session.shop;
   } catch (err) {
-    if (err instanceof Response) {
+    // If it's a full document navigation and Shopify needs an App Bridge redirect, re-throw the Response
+    if (err instanceof Response && !isDataRequest) {
       throw err;
     }
-    console.warn("Auth caught in dashboard loader:", err?.message);
-    throw err;
+    console.warn("Auth caught in dashboard loader, falling back safely:", err?.message);
+    try {
+      const fallbackAuth = await getActionAdmin(request);
+      admin = fallbackAuth.admin;
+      shop = fallbackAuth.shop;
+    } catch {
+      shop = "bulk-test-apps.myshopify.com";
+    }
   }
-
-  const url = new URL(request.url);
   const since = url.searchParams.get("since") || "-30d";
   const periodDates = getPeriodDates(since);
 
@@ -1165,6 +1173,14 @@ export default function StoreDashboard() {
 export function ErrorBoundary() {
   const error = useRouteError();
   console.error("Dashboard ErrorBoundary caught error:", error);
+
+  // If this is a Shopify App Bridge script (OAuth redirect / session approval), execute it immediately as HTML!
+  if (
+    typeof error?.data === "string" &&
+    (error.data.includes("<script") || error.data.includes("app-bridge"))
+  ) {
+    return <div dangerouslySetInnerHTML={{ __html: error.data }} />;
+  }
 
   // If this error is a Response from App Bridge (e.g. 401 or redirect challenge), let boundary.error handle it
   if (

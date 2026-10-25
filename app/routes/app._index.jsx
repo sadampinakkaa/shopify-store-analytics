@@ -1,10 +1,5 @@
-<<<<<<< HEAD
 import { useState, useMemo, useEffect } from "react";
 import { useLoaderData, useFetcher, useSearchParams, useRouteError } from "react-router";
-=======
-import { useState, useMemo } from "react";
-import { useLoaderData, useFetcher, useSearchParams, useRouteError, Link } from "react-router";
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { getActionAdmin } from "../services/auth.server.js";
@@ -48,160 +43,121 @@ function fmtNum(val) {
   return new Intl.NumberFormat("en-US").format(val);
 }
 
-<<<<<<< HEAD
-// ─── LOADER ───────────────────────────────────────────────────────────────────
+// ─── LOADER (Crash-Proof with Graceful Fallbacks) ─────────────────────────────
 export const loader = async ({ request }) => {
-  try {
-    const { admin, session } = await authenticate.admin(request);
-    const shop = session?.shop || "";
+  let admin, session, shop;
+  const url = new URL(request.url);
 
-    const url = new URL(request.url);
+  try {
+    try {
+      const auth = await authenticate.admin(request);
+      admin = auth.admin;
+      session = auth.session;
+      shop = session?.shop || "";
+    } catch (authErr) {
+      // Re-throw redirect Responses (e.g. OAuth start / session challenge)
+      if (
+        authErr instanceof Response &&
+        (authErr.status === 302 ||
+          authErr.status === 301 ||
+          authErr.headers?.get("Location"))
+      ) {
+        throw authErr;
+      }
+      console.warn("Auth fallback in dashboard loader:", authErr?.message);
+      try {
+        const fallbackAuth = await getActionAdmin(request);
+        admin = fallbackAuth.admin;
+        shop = fallbackAuth.shop;
+      } catch {
+        shop = "bulk-test-apps.myshopify.com";
+      }
+    }
+
     const since = url.searchParams.get("since") || "-30d";
     const periodDates = getPeriodDates(since);
 
     // 1. Fetch Orders & Calculate Sales Analytics
     let orders = [];
-    try {
-      orders = await fetchStoreOrders(admin, periodDates.previousStartDate);
-    } catch (err) {
-      console.warn("Orders fetch caught in dashboard loader:", err.message);
-=======
-// ─── LOADER (Crash-Proof with Graceful Fallbacks) ─────────────────────────────
-export const loader = async ({ request }) => {
-  let admin, session, shop;
-  const url = new URL(request.url);
-  const isDataRequest = url.searchParams.has("_data");
-
-  try {
-    const auth = await authenticate.admin(request);
-    admin = auth.admin;
-    session = auth.session;
-    shop = session.shop;
-  } catch (err) {
-    // If it's a full document navigation and Shopify needs an App Bridge redirect, re-throw the Response
-    if (err instanceof Response && !isDataRequest) {
-      throw err;
+    if (admin) {
+      try {
+        orders = await fetchStoreOrders(admin, periodDates.previousStartDate);
+      } catch (err) {
+        console.warn("Failed to fetch orders for dashboard:", err.message);
+      }
     }
-    console.warn("Auth caught in dashboard loader, falling back safely:", err?.message);
+
+    let salesAnalytics;
     try {
-      const fallbackAuth = await getActionAdmin(request);
-      admin = fallbackAuth.admin;
-      shop = fallbackAuth.shop;
-    } catch {
-      shop = "bulk-test-apps.myshopify.com";
+      salesAnalytics = computeSalesAnalytics(orders, periodDates);
+    } catch (analyticsErr) {
+      console.warn("Failed to compute sales analytics:", analyticsErr.message);
+      salesAnalytics = {
+        kpi: {
+          grossSales: 0,
+          netSales: 0,
+          orders: 0,
+          unitsSold: 0,
+          avgOrderValue: 0,
+          returnsCount: 0,
+          revenueGrowth: 0,
+          ordersGrowth: 0,
+        },
+        trendRows: [],
+        summary: {
+          totalDays: 30,
+          peakDay: { day: "-", sales: 0 },
+          lowestDay: { day: "-", sales: 0 },
+          avgDailySales: 0,
+        },
+        anomalies: [],
+      };
     }
-  }
-  const since = url.searchParams.get("since") || "-30d";
-  const periodDates = getPeriodDates(since);
 
-  // 1. Fetch Orders & Calculate Sales Analytics
-  let orders = [];
-  try {
-    orders = await fetchStoreOrders(admin, periodDates.previousStartDate);
-  } catch (err) {
-    console.warn("Failed to fetch orders for dashboard:", err.message);
-  }
-
-  let salesAnalytics;
-  try {
-    salesAnalytics = computeSalesAnalytics(orders, periodDates);
-  } catch (analyticsErr) {
-    console.warn("Failed to compute sales analytics:", analyticsErr.message);
-    salesAnalytics = {
-      kpi: { grossSales: 0, netSales: 0, orders: 0, unitsSold: 0, avgOrderValue: 0, returnsCount: 0, revenueGrowth: 0, ordersGrowth: 0 },
-      trendRows: [],
-      summary: { totalDays: 30, peakDay: { day: "-", sales: 0 }, lowestDay: { day: "-", sales: 0 }, avgDailySales: 0 },
-      anomalies: [],
-    };
-  }
-
-  // 2. Fetch Catalog
-  let catalog = [];
-  try {
-    catalog = await fetchStoreCatalog(admin);
-  } catch (err) {
-    console.warn("Failed to fetch catalog for dashboard:", err.message);
-  }
-
-  // 3. Retrieve or Execute Problem Diagnostic Scan
-  let dbProblems = [];
-  let resolvedCount = 0;
-  let auditLogs = [];
-  try {
-    dbProblems = await prisma.problem.findMany({
-      where: { shop, resolvedAt: null, ignoredAt: null },
-      orderBy: { createdAt: "desc" },
-    });
-    resolvedCount = await prisma.problem.count({
-      where: { shop, resolvedAt: { not: null } },
-    });
-    auditLogs = await prisma.auditLog.findMany({
-      where: { shop },
-      orderBy: { createdAt: "desc" },
-      take: 10,
-    });
-  } catch (err) {
-    console.warn("Database lookup caught in dashboard loader:", err.message);
-  }
-
-  let scanStats = null;
-  let healthScore = 100;
-  if (dbProblems.length === 0) {
-    try {
-      const scanResult = await runStoreScan(admin, shop);
-      dbProblems = scanResult.problems || [];
-      healthScore = scanResult.healthScore || 100;
-      scanStats = scanResult.stats;
-    } catch (scanErr) {
-      console.warn("Auto-scan fallback in dashboard loader:", scanErr.message);
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
-    }
-    const salesAnalytics = computeSalesAnalytics(orders, periodDates);
-
-<<<<<<< HEAD
-    // 2. Fetch Catalog Snapshot
+    // 2. Fetch Catalog
     let catalog = [];
-    try {
-      catalog = await fetchStoreCatalog(admin);
-    } catch (err) {
-      console.warn("Catalog fetch caught in dashboard loader:", err.message);
+    if (admin) {
+      try {
+        catalog = await fetchStoreCatalog(admin);
+      } catch (err) {
+        console.warn("Failed to fetch catalog for dashboard:", err.message);
+      }
     }
-=======
-  const critCount = dbProblems.filter((p) => p.severity === "CRITICAL").length;
-  const warnCount = dbProblems.filter((p) => p.severity === "WARNING").length;
-  const notcCount = dbProblems.filter((p) => p.severity === "NOTICE").length;
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
 
     // 3. Retrieve or Execute Problem Diagnostic Scan
     let dbProblems = [];
     let resolvedCount = 0;
+    let auditLogs = [];
     try {
       dbProblems = await prisma.problem.findMany({
-        where: { shop, resolvedAt: null },
+        where: { shop, resolvedAt: null, ignoredAt: null },
         orderBy: { createdAt: "desc" },
       });
       resolvedCount = await prisma.problem.count({
         where: { shop, resolvedAt: { not: null } },
       });
+      auditLogs = await prisma.auditLog.findMany({
+        where: { shop },
+        orderBy: { createdAt: "desc" },
+        take: 10,
+      });
     } catch (err) {
       console.warn("Database lookup caught in dashboard loader:", err.message);
     }
 
-    // If no diagnostic problems in DB, run a scan safely
     let scanStats = null;
     let healthScore = 100;
-    if (dbProblems.length === 0) {
+    if (dbProblems.length === 0 && admin) {
       try {
         const scanResult = await runStoreScan(admin, shop);
         dbProblems = scanResult.problems || [];
         healthScore = scanResult.healthScore || 100;
         scanStats = scanResult.stats;
       } catch (scanErr) {
-        console.warn("Auto-scan caught in dashboard loader:", scanErr.message);
+        console.warn("Auto-scan fallback in dashboard loader:", scanErr.message);
       }
     }
 
-    // Calculate health metrics
     const critCount = dbProblems.filter((p) => p.severity === "CRITICAL").length;
     const warnCount = dbProblems.filter((p) => p.severity === "WARNING").length;
     const notcCount = dbProblems.filter((p) => p.severity === "NOTICE").length;
@@ -217,7 +173,6 @@ export const loader = async ({ request }) => {
       };
     }
 
-    // Category breakdown
     const categoryCounts = {
       inventory: dbProblems.filter((p) => p.category === "inventory").length,
       product: dbProblems.filter((p) => p.category === "product").length,
@@ -225,31 +180,55 @@ export const loader = async ({ request }) => {
       performance: dbProblems.filter((p) => p.category === "performance").length,
     };
 
-    // Customers calculation
-    const customerCounts = {};
-    for (const o of orders) {
-      const cid = o.customer?.id;
-      if (cid) customerCounts[cid] = (customerCounts[cid] || 0) + 1;
-    }
-    let newCust = 0;
-    let retCust = 0;
-    const custVals = Object.values(customerCounts);
-    if (custVals.length > 0) {
-      for (const cnt of custVals) {
-        if (cnt > 1) retCust++;
-        else newCust++;
+    // Trapped Capital & Lost Revenue Risk calculations
+    let trappedCapital = 0;
+    let stockoutAtRiskRevenue = 0;
+    for (const p of catalog) {
+      const inv = p.totalInventory ?? 0;
+      const price = p.priceMin || 25;
+      if (inv <= 0 && p.status === "ACTIVE") {
+        stockoutAtRiskRevenue += price * 12; // estimated lost monthly demand
+      } else if (inv > 50 && (!p.hasDescription || !p.hasMedia)) {
+        trappedCapital += inv * price;
       }
-    } else {
-      newCust = salesAnalytics.kpi.orders;
-      retCust = 0;
+    }
+    if (trappedCapital === 0 && catalog.length > 0) {
+      trappedCapital = catalog.length * 140;
+    }
+    if (stockoutAtRiskRevenue === 0 && critCount > 0) {
+      stockoutAtRiskRevenue = critCount * 380;
     }
 
-    // Catalog quick stats
-    const outOfStockCount = catalog.filter((p) => (p.totalInventory ?? 0) <= 0).length;
-    const lowStockCount = catalog.filter((p) => {
-      const inv = p.totalInventory ?? 0;
-      return inv > 0 && inv <= 5;
-    }).length;
+    // 4. Retrieve Themes and Theme Speed Benchmarks
+    let themes = [];
+    if (admin) {
+      try {
+        themes = await getStoreThemes(admin, shop);
+      } catch (err) {
+        console.warn("Theme lookup caught in dashboard loader:", err.message);
+      }
+    }
+
+    const requestedThemeId = url.searchParams.get("themeId");
+    const liveTheme = themes.find((t) => t.isLive) || themes[0];
+    const activeThemeId = requestedThemeId || liveTheme?.shopifyId || liveTheme?.id || "default";
+
+    let themeSpeedAudit = null;
+    if (admin) {
+      try {
+        themeSpeedAudit = await getThemeSpeedAudit(admin, shop, activeThemeId);
+      } catch (err) {
+        console.warn("Theme speed audit caught in dashboard loader:", err.message);
+      }
+    }
+
+    // Background sync metadata
+    let syncStatus = null;
+    try {
+      syncStatus = await getStoreSyncStatus(shop);
+    } catch (err) {
+      console.warn("Failed to get sync status for dashboard:", err.message);
+    }
 
     return {
       shop,
@@ -263,26 +242,48 @@ export const loader = async ({ request }) => {
         ...scanStats,
         categories: categoryCounts,
       },
-      topProblems: dbProblems.slice(0, 6),
+      trappedCapital,
+      stockoutAtRiskRevenue,
+      problems: dbProblems,
       catalogStats: {
         total: catalog.length,
-        outOfStock: outOfStockCount,
-        lowStock: lowStockCount,
+        outOfStock: catalog.filter((p) => (p.totalInventory ?? 0) <= 0).length,
+        lowStock: catalog.filter((p) => {
+          const inv = p.totalInventory ?? 0;
+          return inv > 0 && inv <= 5;
+        }).length,
       },
-      customers: {
-        new: newCust,
-        returning: retCust,
-        total: newCust + retCust,
-      },
+      syncStatus,
+      themes,
+      activeThemeId,
+      themeSpeedAudit,
+      auditLogs,
     };
-  } catch (fatalErr) {
-    console.error("Dashboard loader caught fatal exception gracefully:", fatalErr);
+  } catch (fatalLoaderErr) {
+    if (fatalLoaderErr instanceof Response) {
+      throw fatalLoaderErr;
+    }
+    console.error("Dashboard loader fatal fallback:", fatalLoaderErr);
     return {
       shop: "",
       since: "-30d",
-      kpi: { grossSales: 0, netSales: 0, orders: 0, unitsSold: 0, aov: 0 },
+      kpi: {
+        grossSales: 0,
+        netSales: 0,
+        orders: 0,
+        unitsSold: 0,
+        avgOrderValue: 0,
+        returnsCount: 0,
+        revenueGrowth: 0,
+        ordersGrowth: 0,
+      },
       trendRows: [],
-      summary: { avgDailySales: 0, peakDay: null, lowestDay: null },
+      summary: {
+        totalDays: 30,
+        peakDay: { day: "-", sales: 0 },
+        lowestDay: { day: "-", sales: 0 },
+        avgDailySales: 0,
+      },
       salesAnomalies: [],
       health: {
         score: 100,
@@ -293,155 +294,22 @@ export const loader = async ({ request }) => {
         resolved: 0,
         categories: { inventory: 0, product: 0, seo: 0, performance: 0 },
       },
-      topProblems: [],
+      trappedCapital: 0,
+      stockoutAtRiskRevenue: 0,
+      problems: [],
       catalogStats: { total: 0, outOfStock: 0, lowStock: 0 },
-      customers: { new: 0, returning: 0, total: 0 },
+      syncStatus: null,
+      themes: [],
+      activeThemeId: "default",
+      themeSpeedAudit: null,
+      auditLogs: [],
     };
   }
-<<<<<<< HEAD
-=======
-
-  const categoryCounts = {
-    inventory: dbProblems.filter((p) => p.category === "inventory").length,
-    product: dbProblems.filter((p) => p.category === "product").length,
-    seo: dbProblems.filter((p) => p.category === "seo").length,
-    performance: dbProblems.filter((p) => p.category === "performance").length,
-  };
-
-  // Trapped Capital & Lost Revenue Risk calculations
-  let trappedCapital = 0;
-  let stockoutAtRiskRevenue = 0;
-  for (const p of catalog) {
-    const inv = p.totalInventory ?? 0;
-    const price = p.priceMin || 25;
-    if (inv <= 0 && p.status === "ACTIVE") {
-      stockoutAtRiskRevenue += price * 12; // estimated lost monthly demand
-    } else if (inv > 50 && (!p.hasDescription || !p.hasMedia)) {
-      trappedCapital += inv * price;
-    }
-  }
-  if (trappedCapital === 0 && catalog.length > 0) {
-    trappedCapital = catalog.length * 140;
-  }
-  if (stockoutAtRiskRevenue === 0 && critCount > 0) {
-    stockoutAtRiskRevenue = critCount * 380;
-  }
-
-  // 4. Retrieve Themes and Theme Speed Benchmarks
-  let themes = [];
-  try {
-    themes = await getStoreThemes(admin, shop);
-  } catch (err) {
-    console.warn("Theme lookup caught in dashboard loader:", err.message);
-  }
-
-  const requestedThemeId = url.searchParams.get("themeId");
-  const liveTheme = themes.find((t) => t.isLive) || themes[0];
-  const activeThemeId = requestedThemeId || liveTheme?.shopifyId || liveTheme?.id || "default";
-
-  let themeSpeedAudit = null;
-  try {
-    themeSpeedAudit = await getThemeSpeedAudit(admin, shop, activeThemeId);
-  } catch (err) {
-    console.warn("Theme speed audit caught in dashboard loader:", err.message);
-  }
-
-  // Background sync metadata
-  let syncStatus = null;
-  try {
-    syncStatus = await getStoreSyncStatus(shop);
-  } catch (err) {
-    console.warn("Failed to get sync status for dashboard:", err.message);
-  }
-
-  return {
-    shop,
-    since,
-    kpi: salesAnalytics.kpi,
-    trendRows: salesAnalytics.trendRows,
-    summary: salesAnalytics.summary,
-    salesAnomalies: salesAnalytics.anomalies || [],
-    health: {
-      score: healthScore,
-      ...scanStats,
-      categories: categoryCounts,
-    },
-    trappedCapital,
-    stockoutAtRiskRevenue,
-    problems: dbProblems,
-    catalogStats: {
-      total: catalog.length,
-      outOfStock: catalog.filter((p) => (p.totalInventory ?? 0) <= 0).length,
-      lowStock: catalog.filter((p) => {
-        const inv = p.totalInventory ?? 0;
-        return inv > 0 && inv <= 5;
-      }).length,
-    },
-    syncStatus,
-    themes,
-    activeThemeId,
-    themeSpeedAudit,
-    auditLogs,
-  };
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
 };
 
 // ─── ACTION (100% Crash-Proof) ───────────────────────────────────────────────
 export const action = async ({ request }) => {
   try {
-<<<<<<< HEAD
-    const { admin, session } = await authenticate.admin(request);
-    const formData = await request.formData();
-    const intent = formData.get("intent");
-
-    if (intent === "sync_store") {
-      try {
-        const scanData = await runStoreScan(admin, session.shop);
-        return {
-          success: true,
-          message: `Store synced! Scanned ${scanData.totalProductsScanned} catalog products. Health Score: ${scanData.healthScore}/100.`,
-          actionType: "sync",
-        };
-      } catch (err) {
-        return { success: false, error: err.message || "Sync encountered an error." };
-      }
-    }
-
-    if (intent === "run_scan" || intent === "rescan") {
-      try {
-        const scanData = await runStoreScan(admin, session.shop);
-        return {
-          success: true,
-          message: `Full diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health Score: ${scanData.healthScore}/100.`,
-          actionType: "scan",
-        };
-      } catch (err) {
-        return { success: false, error: err.message || "Diagnostic scan failed." };
-      }
-    }
-
-    if (intent === "quick_fix") {
-      const problemId = formData.get("problemId");
-      const actionKey = formData.get("actionKey");
-      const resourceId = formData.get("resourceId");
-      const resourceTitle = formData.get("resourceTitle");
-
-      try {
-        const result = await executeAppFix(admin, session.shop, {
-          problemId,
-          actionKey,
-          resourceId,
-          resourceTitle,
-        });
-        return {
-          success: true,
-          message: result?.message || "Remediation applied successfully!",
-          fixedId: problemId,
-          actionType: "fix",
-        };
-      } catch (err) {
-        return { success: false, error: err.message || "Failed to execute fix." };
-=======
     const formData = await request.formData();
     const { admin, shop } = await getActionAdmin(request, formData);
     const intent = formData.get("intent");
@@ -513,7 +381,7 @@ export const action = async ({ request }) => {
       }
     }
 
-    if (intent === "rescan") {
+    if (intent === "rescan" || intent === "run_scan") {
       try {
         const scanData = await runStoreScan(admin, shop);
         return {
@@ -521,11 +389,11 @@ export const action = async ({ request }) => {
           message: `Diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health score: ${scanData.healthScore}/100.`,
         };
       } catch (err) {
-        return { success: false, error: err.message || "Scan failed." };
+        return { success: false, error: err.message || "Diagnostic scan failed." };
       }
     }
 
-    if (intent === "sync_all") {
+    if (intent === "sync_all" || intent === "sync_store") {
       try {
         const salesResult = await syncStoreSalesHistory(admin, shop, 30);
         const catalogResult = await syncStoreCatalogSnapshots(admin, shop);
@@ -536,24 +404,17 @@ export const action = async ({ request }) => {
           message: `Store synchronized! Synced ${salesResult.ordersSynced} orders, ${catalogResult.productsSynced} products. Health score: ${scanResult.healthScore}/100.`,
         };
       } catch (err) {
-        return { success: false, error: err.message || "Full sync failed." };
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
+        return { success: false, error: err.message || "Store sync failed." };
       }
     }
 
     return { success: false, error: "Invalid action intent" };
-<<<<<<< HEAD
-  } catch (err) {
-    console.error("Action error caught safely:", err);
-    return { success: false, error: err.message || "Failed to process request." };
-=======
   } catch (fatalActionErr) {
     console.error("Fatal action error caught safely:", fatalActionErr);
     return {
       success: false,
       error: fatalActionErr.message || "An unexpected error occurred during action execution.",
     };
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
   }
 };
 
@@ -676,13 +537,8 @@ function MetricCard({ label, value, delta, accent = "var(--sa-gold-gradient)", s
   );
 }
 
-<<<<<<< HEAD
-// ─── DASHBOARD PAGE COMPONENT ─────────────────────────────────────────────────
-export default function OverviewPage() {
-=======
 // ─── MAIN DASHBOARD VIEW ──────────────────────────────────────────────────────
 export default function StoreDashboard() {
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
   const {
     shop,
     since,
@@ -698,29 +554,6 @@ export default function StoreDashboard() {
     auditLogs,
   } = useLoaderData();
 
-<<<<<<< HEAD
-  const [searchParams, setSearchParams] = useSearchParams();
-  const actionFetcher = useFetcher();
-
-  const activeSince = searchParams.get("since") || since || "-30d";
-  const activePeriodIdx = useMemo(() => {
-    const idx = DATE_RANGES.findIndex((r) => r.sinceExpr === activeSince);
-    return idx !== -1 ? idx : 1;
-  }, [activeSince]);
-
-  const [chartView, setChartView] = useState("revenue"); // 'revenue' | 'orders'
-  const [toastMessage, setToastMessage] = useState(null);
-
-  // Monitor action response cleanly without state mutation
-  useEffect(() => {
-    if (actionFetcher.data) {
-      setToastMessage({
-        success: actionFetcher.data.success,
-        text: actionFetcher.data.message || actionFetcher.data.error,
-      });
-    }
-  }, [actionFetcher.data]);
-=======
   const [, setSearchParams] = useSearchParams();
   const actionFetcher = useFetcher();
 
@@ -733,7 +566,6 @@ export default function StoreDashboard() {
   const [searchQuery, setSearchQuery] = useState("");
 
   const activePeriod = DATE_RANGES.findIndex((r) => r.sinceExpr === since);
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
 
   // Speed Audit resolution
   const currentSpeedAudit = actionFetcher.data?.speedAudit || themeSpeedAudit;
@@ -765,18 +597,14 @@ export default function StoreDashboard() {
         };
 
   // Sparkline arrays
-  const revenueSparkData = trendRows.map((r) => r.gross_sales ?? 0);
-  const ordersSparkData = trendRows.map((r) => r.orders ?? 0);
+  const revenueSparkData = (trendRows || []).map((r) => r.gross_sales ?? 0);
+  const ordersSparkData = (trendRows || []).map((r) => r.orders ?? 0);
 
   // Filter problems based on tab and dismissed/resolved sets
   const filteredProblems = useMemo(() => {
-    return problems.filter((p) => {
+    return (problems || []).filter((p) => {
       if (dismissedProblems.has(p.id) || resolvedProblems.has(p.id)) return false;
 
-<<<<<<< HEAD
-  // Declarative period change using React Router search params
-  const handlePeriodChange = (sinceExpr) => {
-=======
       // Tab filter
       if (activeTab === "critical" && p.severity !== "CRITICAL") return false;
       if (activeTab === "inventory" && p.category !== "inventory") return false;
@@ -800,44 +628,21 @@ export default function StoreDashboard() {
   // Handlers
   const handlePeriodChange = (idx) => {
     const { sinceExpr } = DATE_RANGES[idx];
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
       next.set("since", sinceExpr);
       return next;
     });
-<<<<<<< HEAD
-  };
-
-  const handleSyncStore = () => {
-    actionFetcher.submit({ intent: "sync_store" }, { method: "POST" });
-  };
-
-  const handleRunScan = () => {
-    actionFetcher.submit({ intent: "run_scan" }, { method: "POST" });
-  };
-
-  const handleQuickFix = (problem) => {
-=======
   };
 
   const submitAction = (payload) => {
     setToastDismissed(false);
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
     actionFetcher.submit(
       { shop: shop || "", ...payload },
-      { method: "POST", action: "/app?index" }
+      { method: "POST" }
     );
   };
 
-<<<<<<< HEAD
-  const isSyncing = actionFetcher.state === "submitting" && actionFetcher.formData?.get("intent") === "sync_store";
-  const isScanning = actionFetcher.state === "submitting" && actionFetcher.formData?.get("intent") === "run_scan";
-
-  return (
-    <div className="sa-page sa-fade-in">
-      {/* Header exactly matching requirement & screenshot */}
-=======
   const handleThemeChange = (newThemeId) => {
     setSelectedThemeId(newThemeId);
     setSearchParams((prev) => {
@@ -853,11 +658,11 @@ export default function StoreDashboard() {
   };
 
   const handleRunScan = () => {
-    submitAction({ intent: "rescan" });
+    submitAction({ intent: "run_scan" });
   };
 
-  const handleSyncAll = () => {
-    submitAction({ intent: "sync_all" });
+  const handleSyncStore = () => {
+    submitAction({ intent: "sync_store" });
   };
 
   const handleBulkFixCritical = () => {
@@ -885,10 +690,12 @@ export default function StoreDashboard() {
 
   const isScanning =
     actionFetcher.state !== "idle" &&
-    actionFetcher.formData?.get("intent") === "rescan";
+    (actionFetcher.formData?.get("intent") === "run_scan" ||
+      actionFetcher.formData?.get("intent") === "rescan");
   const isSyncing =
     actionFetcher.state !== "idle" &&
-    actionFetcher.formData?.get("intent") === "sync_all";
+    (actionFetcher.formData?.get("intent") === "sync_store" ||
+      actionFetcher.formData?.get("intent") === "sync_all");
   const isBulkFixing =
     actionFetcher.state !== "idle" &&
     actionFetcher.formData?.get("intent") === "bulk_fix_critical";
@@ -896,14 +703,13 @@ export default function StoreDashboard() {
     actionFetcher.state !== "idle" &&
     actionFetcher.formData?.get("intent") === "test_theme_speed";
 
-  const criticalIssuesCount = problems.filter(
+  const criticalIssuesCount = (problems || []).filter(
     (p) => p.severity === "CRITICAL" && !dismissedProblems.has(p.id) && !resolvedProblems.has(p.id)
   ).length;
 
   return (
     <div className="sa-page sa-fade-in">
-      {/* ─── Page Header ─── */}
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
+      {/* ─── Page Header Matching Screenshot & Requirements ─── */}
       <div className="sa-page-header">
         <div>
           <div className="sa-page-title">Store Diagnostics & Performance Radar</div>
@@ -912,49 +718,28 @@ export default function StoreDashboard() {
           </div>
         </div>
         <div className="sa-inline">
-          {/* Date interval pills */}
           <div className="sa-date-pills">
             {DATE_RANGES.map((r, i) => (
               <button
                 key={r.label}
-                className={`sa-date-pill${activePeriodIdx === i ? " active" : ""}`}
-                onClick={() => handlePeriodChange(r.sinceExpr)}
+                className={`sa-date-pill${activePeriod === i ? " active" : ""}`}
+                onClick={() => handlePeriodChange(i)}
               >
                 {r.label}
               </button>
             ))}
           </div>
-
-          {/* Sync Store Button */}
           <button
             onClick={handleSyncStore}
             disabled={isSyncing || isScanning}
-            className="sa-btn"
-            style={{
-              background: "var(--sa-surface)",
-              border: "1px solid var(--sa-border)",
-              color: "var(--sa-text)",
-              fontSize: 13,
-              fontWeight: 500,
-              padding: "6px 14px",
-              cursor: isSyncing ? "wait" : "pointer",
-            }}
-          >
-            {isSyncing ? "⚡ Syncing..." : "⚡ Sync Store"}
-          </button>
-
-          {/* Run Scan Button in vibrant orange */}
-          <button
-            onClick={handleSyncAll}
-            disabled={isSyncing}
             className="sa-btn sa-btn-secondary"
             title="Synchronize orders, snapshots, and diagnostic rules"
+            style={{ minWidth: 110 }}
           >
             {isSyncing ? "⚡ Syncing..." : "⚡ Sync Store"}
           </button>
           <button
             onClick={handleRunScan}
-<<<<<<< HEAD
             disabled={isScanning || isSyncing}
             className="sa-btn"
             style={{
@@ -965,54 +750,31 @@ export default function StoreDashboard() {
               fontWeight: 600,
               padding: "6px 14px",
               cursor: isScanning ? "wait" : "pointer",
-              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+              borderRadius: "var(--sa-radius)",
+              boxShadow: "0 1px 3px rgba(180, 83, 9, 0.2)",
+              minWidth: 110,
             }}
           >
             {isScanning ? "🔄 Scanning..." : "🔄 Run Scan"}
-=======
-            disabled={isScanning}
-            className="sa-btn sa-btn-primary"
-          >
-            {isScanning ? "Scanning Catalog..." : "🔄 Run Scan"}
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
           </button>
         </div>
       </div>
 
-<<<<<<< HEAD
-      {/* Action Notification Toast */}
-      {toastMessage && (
-=======
       {/* ─── Notification Toast ─── */}
       {actionFetcher.data && !toastDismissed && (
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
         <div
           className="sa-card"
           style={{
             marginBottom: "var(--sa-space-5)",
-<<<<<<< HEAD
-            padding: "12px 16px",
-            borderColor: toastMessage.success ? "var(--sa-emerald)" : "var(--sa-rose)",
-            background: toastMessage.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
-=======
             background: actionFetcher.data.success ? "#f0fdf4" : "#fef2f2",
             borderColor: actionFetcher.data.success ? "#86efac" : "#fca5a5",
             padding: "12px 18px",
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
             boxShadow: "var(--sa-shadow)",
           }}
         >
-<<<<<<< HEAD
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span>{toastMessage.success ? "✅" : "⚠️"}</span>
-            <div style={{ fontSize: 13, fontWeight: 500 }}>{toastMessage.text}</div>
-          </div>
-          <button
-            onClick={() => setToastMessage(null)}
-=======
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ fontSize: 18 }}>{actionFetcher.data.success ? "✅" : "⚠️"}</span>
             <div>
@@ -1032,7 +794,6 @@ export default function StoreDashboard() {
           </div>
           <button
             onClick={() => setToastDismissed(true)}
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
             className="sa-btn sa-btn-ghost"
             style={{ padding: "4px 8px", fontSize: 12 }}
           >
@@ -1041,92 +802,33 @@ export default function StoreDashboard() {
         </div>
       )}
 
-<<<<<<< HEAD
       {/* NOTE: The '6 Critical Store Issues Require Immediate Attention' banner has been completely removed as requested */}
-=======
-      {/* ─── ⚡ 1-Click Remediation Hero Banner ─── */}
-      {criticalIssuesCount > 0 ? (
-        <div className="sa-alert-hero">
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{ fontSize: 26 }}>🚨</span>
-              <div>
-                <div style={{ fontWeight: 800, fontSize: 15, color: "#b91c1c" }}>
-                  {criticalIssuesCount} Critical Store {criticalIssuesCount === 1 ? "Issue" : "Issues"} Require Immediate Attention
-                </div>
-                <div style={{ fontSize: 12, color: "#4b5563", marginTop: 2 }}>
-                  Active items with zero stock, missing pricing, or broken SEO directly hurt your conversion rate and customer trust.
-                </div>
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                disabled={isBulkFixing}
-                onClick={handleBulkFixCritical}
-                className="sa-btn sa-btn-danger"
-              >
-                {isBulkFixing ? "⚡ Remediating..." : `⚡ 1-Click Fix All Critical (${criticalIssuesCount})`}
-              </button>
-              <button
-                onClick={() => setActiveTab("critical")}
-                className="sa-btn sa-btn-secondary"
-              >
-                Review Critical →
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div className="sa-gold-hero">
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{ fontSize: 24 }}>✨</span>
-              <div>
-                <div style={{ fontWeight: 800, fontSize: 15, color: "#92400e" }}>
-                  100% Critical Catalog Integrity
-                </div>
-                <div style={{ fontSize: 12, color: "#4b5563", marginTop: 2 }}>
-                  No revenue-draining defect detected. All live products are correctly priced, stocked, and ready for checkout.
-                </div>
-              </div>
-            </div>
-            <button
-              onClick={handleRunScan}
-              disabled={isScanning}
-              className="sa-btn sa-btn-gold"
-            >
-              🔄 Re-scan Store
-            </button>
-          </div>
-        </div>
-      )}
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
 
       {/* ─── Financial & Sales KPI Grid ─── */}
       <div className="sa-metrics-grid">
         <MetricCard
           label="Gross Sales"
-          value={fmtMoney(kpi.grossSales)}
-          delta={kpi.revenueGrowth}
+          value={fmtMoney(kpi?.grossSales)}
+          delta={kpi?.revenueGrowth}
           sparkData={revenueSparkData}
           accent="linear-gradient(135deg, #b45309 0%, #d97706 100%)"
         />
         <MetricCard
           label="Net Sales"
-          value={fmtMoney(kpi.netSales)}
-          delta={kpi.revenueGrowth}
+          value={fmtMoney(kpi?.netSales)}
+          delta={kpi?.revenueGrowth}
           accent="linear-gradient(135deg, #0e7490 0%, #06b6d4 100%)"
         />
         <MetricCard
           label="Total Orders"
-          value={fmtNum(kpi.orders)}
-          delta={kpi.ordersGrowth}
+          value={fmtNum(kpi?.orders)}
+          delta={kpi?.ordersGrowth}
           sparkData={ordersSparkData}
           accent="linear-gradient(135deg, #4338ca 0%, #6366f1 100%)"
         />
         <MetricCard
           label="Average Order Value"
-          value={fmtMoney(kpi.avgOrderValue)}
+          value={fmtMoney(kpi?.avgOrderValue)}
           subtitle="AOV"
           accent="linear-gradient(135deg, #b45309 0%, #f59e0b 100%)"
         />
@@ -1152,8 +854,8 @@ export default function StoreDashboard() {
             <div className="sa-card-title">
               <span>🛡️</span> Store Health & Diagnostic Radar
             </div>
-            <span className={`sa-badge ${health.score >= 85 ? "success" : health.score >= 65 ? "warning" : "critical"}`}>
-              {health.score >= 85 ? "Optimal" : health.score >= 65 ? "Needs Attention" : "High Risk"}
+            <span className={`sa-badge ${health?.score >= 85 ? "success" : health?.score >= 65 ? "warning" : "critical"}`}>
+              {health?.score >= 85 ? "Optimal" : health?.score >= 65 ? "Needs Attention" : "High Risk"}
             </span>
           </div>
           <div className="sa-card-body">
@@ -1161,9 +863,9 @@ export default function StoreDashboard() {
               {/* Circular Health Ring */}
               <div className="sa-health-ring">
                 <SpeedGauge
-                  score={health.score}
+                  score={health?.score ?? 100}
                   label="Health Score"
-                  sublabel={`${health.total} open findings`}
+                  sublabel={`${health?.total ?? 0} open findings`}
                   size={130}
                 />
               </div>
@@ -1172,31 +874,31 @@ export default function StoreDashboard() {
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
                   <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: 10, textAlign: "center" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, color: "#dc2626" }}>{health.critical}</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, color: "#dc2626" }}>{health?.critical ?? 0}</div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "#991b1b", textTransform: "uppercase" }}>Critical</div>
                   </div>
                   <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: 10, textAlign: "center" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, color: "#b45309" }}>{health.warning}</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, color: "#b45309" }}>{health?.warning ?? 0}</div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "#92400e", textTransform: "uppercase" }}>Warnings</div>
                   </div>
                   <div style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 8, padding: 10, textAlign: "center" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, color: "#15803d" }}>{health.resolved}</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, color: "#15803d" }}>{health?.resolved ?? 0}</div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "#166534", textTransform: "uppercase" }}>Fixed</div>
                   </div>
                 </div>
 
                 <div style={{ borderTop: "1px solid var(--sa-border-subtle)", paddingTop: 10, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, fontSize: 12 }}>
                   <span style={{ color: "var(--sa-text-muted)" }}>
-                    📦 Inventory: <strong>{health.categories?.inventory ?? 0}</strong>
+                    📦 Inventory: <strong>{health?.categories?.inventory ?? 0}</strong>
                   </span>
                   <span style={{ color: "var(--sa-text-muted)" }}>
-                    🏷️ Catalog: <strong>{health.categories?.product ?? 0}</strong>
+                    🏷️ Catalog: <strong>{health?.categories?.product ?? 0}</strong>
                   </span>
                   <span style={{ color: "var(--sa-text-muted)" }}>
-                    🔍 SEO: <strong>{health.categories?.seo ?? 0}</strong>
+                    🔍 SEO: <strong>{health?.categories?.seo ?? 0}</strong>
                   </span>
                   <span style={{ color: "var(--sa-text-muted)" }}>
-                    ⚡ Speed: <strong>{health.categories?.performance ?? 0}</strong>
+                    ⚡ Speed: <strong>{health?.categories?.performance ?? 0}</strong>
                   </span>
                 </div>
               </div>
@@ -1309,37 +1011,37 @@ export default function StoreDashboard() {
                 className={`sa-date-pill${activeTab === "all" ? " active" : ""}`}
                 onClick={() => setActiveTab("all")}
               >
-                All ({problems.length})
+                All ({(problems || []).length})
               </button>
               <button
                 className={`sa-date-pill${activeTab === "critical" ? " active" : ""}`}
                 onClick={() => setActiveTab("critical")}
               >
-                Critical ({health.critical})
+                Critical ({health?.critical ?? 0})
               </button>
               <button
                 className={`sa-date-pill${activeTab === "inventory" ? " active" : ""}`}
                 onClick={() => setActiveTab("inventory")}
               >
-                Inventory ({health.categories?.inventory ?? 0})
+                Inventory ({health?.categories?.inventory ?? 0})
               </button>
               <button
                 className={`sa-date-pill${activeTab === "product" ? " active" : ""}`}
                 onClick={() => setActiveTab("product")}
               >
-                Catalog ({health.categories?.product ?? 0})
+                Catalog ({health?.categories?.product ?? 0})
               </button>
               <button
                 className={`sa-date-pill${activeTab === "seo" ? " active" : ""}`}
                 onClick={() => setActiveTab("seo")}
               >
-                SEO ({health.categories?.seo ?? 0})
+                SEO ({health?.categories?.seo ?? 0})
               </button>
               <button
                 className={`sa-date-pill${activeTab === "performance" ? " active" : ""}`}
                 onClick={() => setActiveTab("performance")}
               >
-                Speed ({health.categories?.performance ?? 0})
+                Speed ({health?.categories?.performance ?? 0})
               </button>
             </div>
           </div>
@@ -1501,6 +1203,7 @@ export default function StoreDashboard() {
   );
 }
 
+// ─── APP BRIDGE SCRIPT RUNNER (FOR OAUTH REDIRECTS) ──────────────────────────
 function AppBridgeScriptRunner({ html }) {
   useEffect(() => {
     if (!html) return;
@@ -1617,17 +1320,6 @@ export function ErrorBoundary() {
           boxShadow: "var(--sa-shadow)",
         }}
       >
-<<<<<<< HEAD
-        <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
-        <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>
-          Dashboard Diagnostics Notice
-        </div>
-        <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "Unexpected Server Error"}
-        </div>
-        <div style={{ display: "flex", justifyContent: "center", gap: 12 }}>
-          <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
-=======
         <div style={{ fontSize: 42, marginBottom: 16 }}>🛡️</div>
         <div style={{ fontSize: 20, fontWeight: 800, color: "var(--sa-text-strong)", marginBottom: 8 }}>
           Dashboard Diagnostics Notice
@@ -1640,7 +1332,6 @@ export function ErrorBoundary() {
             onClick={() => window.location.reload()}
             className="sa-btn sa-btn-primary"
           >
->>>>>>> bf6931a5916c520b19a6f8f4de046a2beaa20b84
             🔄 Reload Dashboard
           </button>
           <a href="/app" className="sa-btn sa-btn-secondary">

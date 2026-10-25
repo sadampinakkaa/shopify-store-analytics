@@ -1,4 +1,4 @@
-import prisma from "../db.server";
+import prisma from "../db.server.js";
 
 // ─── THEME SCANNER & SAFETY SERVICE ──────────────────────────────────────────
 // Hard Safety Rule: Scans only the explicitly selected theme.

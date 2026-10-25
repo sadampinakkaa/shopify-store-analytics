@@ -2,16 +2,22 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import { runSeoAudit, fixSeoSnippet } from "../services/seo.server";
+import { bulkFixSeo } from "../services/fixes.server";
+import prisma from "../db.server";
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
   try {
-    const audit = await runSeoAudit(admin, session.shop);
-    return audit;
+    const audit = await runSeoAudit(admin, shop);
+    return { shop, ...audit };
   } catch (err) {
     console.warn("SEO audit failed:", err?.message || err);
     return {
+      shop,
       seoScore: 100,
       stats: { total: 0, critical: 0, warning: 0, notice: 0, canFixCount: 0 },
       issues: [],
@@ -20,8 +26,8 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "fix_seo") {
@@ -30,9 +36,33 @@ export const action = async ({ request }) => {
 
     try {
       const res = await fixSeoSnippet(admin, { productId, productTitle });
+      try {
+        const numericId = productId.replace(/\D/g, "");
+        await prisma.problem.updateMany({
+          where: {
+            shop,
+            OR: [
+              { resourceId: productId },
+              { id: `missing-seo-${numericId}` },
+            ],
+          },
+          data: { resolvedAt: new Date() },
+        });
+      } catch {
+        // Non-critical
+      }
       return { success: true, message: `Updated SEO metadata for "${productTitle}".` };
     } catch (err) {
       return { success: false, error: err.message };
+    }
+  }
+
+  if (intent === "bulk_fix_seo") {
+    try {
+      const result = await bulkFixSeo(admin, shop);
+      return { success: true, message: result.message };
+    } catch (err) {
+      return { success: false, error: err.message || "Bulk SEO optimization failed." };
     }
   }
 
@@ -40,7 +70,7 @@ export const action = async ({ request }) => {
 };
 
 export default function SeoPage() {
-  const { seoScore, stats, issues } = useLoaderData();
+  const { shop, seoScore, stats, issues } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activeFilter, setActiveFilter] = useState("all");
@@ -53,7 +83,15 @@ export default function SeoPage() {
         intent: "fix_seo",
         productId: issue.resourceId,
         productTitle: issue.resourceTitle,
+        shop: shop || "",
       },
+      { method: "post" }
+    );
+  };
+
+  const handleBulkFixSeo = () => {
+    fetcher.submit(
+      { intent: "bulk_fix_seo", shop: shop || "" },
       { method: "post" }
     );
   };
@@ -84,6 +122,18 @@ export default function SeoPage() {
           </div>
         </div>
         <div className="sa-inline">
+          {issues.filter((i) => i.canAutoFix && !fixedIssueIds.has(i.id)).length > 0 && (
+            <button
+              onClick={handleBulkFixSeo}
+              disabled={fetcher.state === "submitting"}
+              className="sa-btn sa-btn-primary"
+              style={{ fontSize: 12, padding: "5px 12px" }}
+            >
+              {fetcher.state === "submitting" && fetcher.formData?.get("intent") === "bulk_fix_seo"
+                ? "Optimizing..."
+                : `⚡ 1-Click Optimize All (${issues.filter((i) => i.canAutoFix && !fixedIssueIds.has(i.id)).length})`}
+            </button>
+          )}
           <span className="sa-badge success">🔍 Google & Bing Snippet Audits</span>
         </div>
       </div>
@@ -245,9 +295,9 @@ export default function SeoPage() {
                       </button>
                     ) : (
                       <a
-                        href={issue.resourceUrl}
+                        href={getShopifyAdminUrl(shop, "products", issue.resourceId || issue.resourceUrl)}
                         target="_blank"
-                        rel="noreferrer"
+                        rel="noopener noreferrer"
                         className="sa-btn sa-btn-ghost"
                         style={{ whiteSpace: "nowrap" }}
                       >
@@ -277,13 +327,34 @@ export default function SeoPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("SEO ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while analyzing SEO visibility.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load SEO analytics</div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while analyzing SEO visibility."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

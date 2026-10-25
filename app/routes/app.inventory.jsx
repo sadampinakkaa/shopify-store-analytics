@@ -1,13 +1,16 @@
 import { useState } from "react";
-import { useLoaderData, useRevalidator, useRouteError } from "react-router";
+import { useLoaderData, useFetcher, useSearchParams, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import {
   getPeriodDates,
   fetchStoreOrders,
   fetchStoreCatalog,
   computeInventoryIntelligence,
 } from "../services/analytics.server";
+import { executeAppFix } from "../services/fixes.server";
 
 const PERIODS = [
   { label: "30D", days: 30 },
@@ -49,18 +52,98 @@ export const loader = async ({ request }) => {
   };
 };
 
+export const action = async ({ request }) => {
+  const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
+  const intent = formData.get("intent");
+
+  if (intent === "quick_restock") {
+    const resourceId = formData.get("resourceId");
+    const resourceTitle = formData.get("resourceTitle");
+    const delta = formData.get("delta") || "10";
+
+    try {
+      const result = await executeAppFix(admin, shop, {
+        actionKey: "ADJUST_INVENTORY",
+        resourceId,
+        resourceTitle,
+        quantityDelta: delta,
+      });
+      return {
+        success: true,
+        message: result?.message || `Added +${delta} units to "${resourceTitle}".`,
+        fixedId: resourceId,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Failed to adjust inventory." };
+    }
+  }
+
+  if (intent === "set_status") {
+    const resourceId = formData.get("resourceId");
+    const resourceTitle = formData.get("resourceTitle");
+    const targetStatus = formData.get("targetStatus") || "DRAFT";
+
+    try {
+      const result = await executeAppFix(admin, shop, {
+        actionKey: "SET_STATUS",
+        resourceId,
+        resourceTitle,
+        targetStatus,
+      });
+      return {
+        success: true,
+        message: result?.message || `Set status of "${resourceTitle}" to ${targetStatus}.`,
+        fixedId: resourceId,
+      };
+    } catch (err) {
+      return { success: false, error: err.message || "Failed to update product status." };
+    }
+  }
+
+  return { success: false, error: "Invalid action intent" };
+};
+
 export default function InventoryPage() {
   const { shop, periodDays, summary, stockoutRiskItems, deadStockItems, overstockItems } =
     useLoaderData();
-  const revalidator = useRevalidator();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const fetcher = useFetcher();
 
   const [activeTab, setActiveTab] = useState("stockout"); // 'stockout' | 'deadstock' | 'overstock'
 
   const handlePeriodChange = (days) => {
-    const url = new URL(window.location.href);
-    url.searchParams.set("days", days.toString());
-    window.history.pushState({}, "", url);
-    revalidator.revalidate();
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set("days", days.toString());
+      return next;
+    });
+  };
+
+  const handleQuickRestock = (item, delta = 10) => {
+    fetcher.submit(
+      {
+        intent: "quick_restock",
+        resourceId: item.id,
+        resourceTitle: item.title,
+        delta: delta.toString(),
+        shop: shop || "",
+      },
+      { method: "POST" }
+    );
+  };
+
+  const handleSetStatus = (item, targetStatus) => {
+    fetcher.submit(
+      {
+        intent: "set_status",
+        resourceId: item.id,
+        resourceTitle: item.title,
+        targetStatus,
+        shop: shop || "",
+      },
+      { method: "POST" }
+    );
   };
 
   return (
@@ -87,6 +170,29 @@ export default function InventoryPage() {
           </div>
         </div>
       </div>
+
+      {/* Action Notification Toast */}
+      {fetcher.data && (
+        <div
+          className="sa-card"
+          style={{
+            marginBottom: "var(--sa-space-5)",
+            padding: "12px 16px",
+            borderColor: fetcher.data.success ? "var(--sa-emerald)" : "var(--sa-rose)",
+            background: fetcher.data.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span>{fetcher.data.success ? "✅" : "⚠️"}</span>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>
+              {fetcher.data.message || fetcher.data.error}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Summary KPI Cards */}
       <div className="sa-metrics-grid">
@@ -163,7 +269,7 @@ export default function InventoryPage() {
                     <th>Weekly Sales Rate</th>
                     <th>Estimated Depletion</th>
                     <th>Urgency</th>
-                    <th>Action</th>
+                    <th>1-Click Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -174,6 +280,10 @@ export default function InventoryPage() {
                         : item.urgency === "HIGH"
                         ? "sa-badge orange"
                         : "sa-badge warning";
+
+                    const isThisRestocking =
+                      fetcher.state === "submitting" &&
+                      fetcher.formData?.get("resourceId") === item.id;
 
                     return (
                       <tr key={item.id}>
@@ -189,15 +299,26 @@ export default function InventoryPage() {
                           <span className={urgencyClass}>{item.urgency}</span>
                         </td>
                         <td>
-                          <a
-                            href={shop ? `https://${shop}/admin/products/${item.id.split("/").pop()}` : `https://admin.shopify.com/store`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="sa-btn sa-btn-ghost"
-                            style={{ padding: "4px 8px", fontSize: 11 }}
-                          >
-                            Reorder in Admin ↗
-                          </a>
+                          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <button
+                              onClick={() => handleQuickRestock(item, 10)}
+                              disabled={fetcher.state === "submitting"}
+                              className="sa-btn sa-btn-primary"
+                              style={{ padding: "4px 8px", fontSize: 11 }}
+                              title="Instantly add +10 inventory units via Shopify API"
+                            >
+                              {isThisRestocking ? "Restocking..." : "⚡ +10 Restock"}
+                            </button>
+                            <a
+                              href={getShopifyAdminUrl(shop, "products", item.id)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="sa-btn sa-btn-ghost"
+                              style={{ padding: "4px 8px", fontSize: 11 }}
+                            >
+                              Admin ↗
+                            </a>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -238,25 +359,48 @@ export default function InventoryPage() {
                     <th>Units Trapped</th>
                     <th>Unit Price</th>
                     <th>Total Capital Tied Up</th>
-                    <th>Recommendation</th>
+                    <th>1-Click Remediation</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {deadStockItems.map((item) => (
-                    <tr key={item.id}>
-                      <td style={{ fontWeight: 600 }}>{item.title}</td>
-                      <td>{fmtNum(item.inventory)} units</td>
-                      <td>{fmtMoney(item.price)}</td>
-                      <td style={{ fontWeight: 600, color: "var(--sa-amber)" }}>
-                        {fmtMoney(item.stockValue)}
-                      </td>
-                      <td>
-                        <span className="sa-badge neutral">
-                          Bundle / Clearance Sale
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                  {deadStockItems.map((item) => {
+                    const isThisDrafting =
+                      fetcher.state === "submitting" &&
+                      fetcher.formData?.get("resourceId") === item.id;
+
+                    return (
+                      <tr key={item.id}>
+                        <td style={{ fontWeight: 600 }}>{item.title}</td>
+                        <td>{fmtNum(item.inventory)} units</td>
+                        <td>{fmtMoney(item.price)}</td>
+                        <td style={{ fontWeight: 600, color: "var(--sa-amber)" }}>
+                          {fmtMoney(item.stockValue)}
+                        </td>
+                        <td>
+                          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <button
+                              onClick={() => handleSetStatus(item, "DRAFT")}
+                              disabled={fetcher.state === "submitting"}
+                              className="sa-btn sa-btn-secondary"
+                              style={{ padding: "4px 8px", fontSize: 11 }}
+                              title="Move product to DRAFT status to clear from active catalog"
+                            >
+                              {isThisDrafting ? "Drafting..." : "💤 Set to Draft"}
+                            </button>
+                            <a
+                              href={getShopifyAdminUrl(shop, "products", item.id)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="sa-btn sa-btn-ghost"
+                              style={{ padding: "4px 8px", fontSize: 11 }}
+                            >
+                              Admin ↗
+                            </a>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             ) : (
@@ -323,13 +467,34 @@ export default function InventoryPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Inventory ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while analyzing inventory.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load inventory intelligence</div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while analyzing inventory."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

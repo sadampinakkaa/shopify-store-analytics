@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
 import { getStoreThemes, scanTheme } from "../services/theme.server";
 
 export const loader = async ({ request }) => {
@@ -27,6 +28,7 @@ export const loader = async ({ request }) => {
   }
 
   return {
+    shop,
     themes,
     defaultThemeId: defaultTheme?.shopifyId || "",
     initialScan,
@@ -34,8 +36,8 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const themeId = formData.get("themeId");
 
   if (!themeId) {
@@ -43,7 +45,7 @@ export const action = async ({ request }) => {
   }
 
   try {
-    const scanResult = await scanTheme(admin, session.shop, themeId);
+    const scanResult = await scanTheme(admin, shop, themeId);
     return { success: true, scanResult };
   } catch (err) {
     return { success: false, error: err.message };
@@ -51,7 +53,7 @@ export const action = async ({ request }) => {
 };
 
 export default function ThemesPage() {
-  const { themes, defaultThemeId, initialScan } = useLoaderData();
+  const { shop, themes, defaultThemeId, initialScan } = useLoaderData();
   const fetcher = useFetcher();
 
   const [selectedThemeId, setSelectedThemeId] = useState(defaultThemeId);
@@ -64,7 +66,10 @@ export default function ThemesPage() {
   const isScanning = fetcher.state !== "idle";
 
   const handleScanTheme = () => {
-    fetcher.submit({ themeId: selectedThemeId }, { method: "post" });
+    fetcher.submit(
+      { themeId: selectedThemeId, shop: shop || "" },
+      { method: "post" }
+    );
   };
 
   const getScoreColor = (score) => {
@@ -354,13 +359,34 @@ export default function ThemesPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Themes ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while analyzing the selected theme.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to audit theme</div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while analyzing the selected theme."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

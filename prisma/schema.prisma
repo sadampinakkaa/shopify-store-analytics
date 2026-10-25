@@ -82,6 +82,7 @@ model Problem {
   scan         Scan?     @relation(fields: [scanId], references: [id])
   severity     String    // CRITICAL | WARNING | NOTICE
   fixType      String    // APP_FIX | DEV_FIX
+  actionKey    String?   // machine-readable fix action key
   category     String    // inventory | product | theme | seo | performance
   title        String
   description  String
@@ -89,6 +90,7 @@ model Problem {
   resourceId   String?   // Shopify GID of affected resource
   resourceType String?   // Product | Variant | Theme | etc.
   resourceUrl  String?   // deep link into Shopify Admin
+  resourceTitle String?  // cached resource title
   resolvedAt   DateTime?
   ignoredAt    DateTime?
   createdAt    DateTime  @default(now())
@@ -139,6 +141,8 @@ model PerformanceTest {
   id            String   @id @default(cuid())
   shop          String
   store         Store    @relation(fields: [shop], references: [shop])
+  themeId       String?  // associated theme ID or shopifyId
+  device        String   @default("mobile") // mobile | desktop
   pageType      String   // home | product | collection | cart | search | blog | etc.
   pageUrl       String
   score         Int      // 0-100
@@ -155,6 +159,7 @@ model PerformanceTest {
   testedAt      DateTime @default(now())
 
   @@index([shop, pageType, testedAt])
+  @@index([shop, themeId, device])
 }
 
 // ─── Theme — cached theme metadata ───────────────────────────────────────────

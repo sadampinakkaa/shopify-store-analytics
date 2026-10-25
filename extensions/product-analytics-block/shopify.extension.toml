@@ -1,0 +1,10 @@
+api_version = "2026-10"
+
+[[extensions]]
+name = "Product Health & Diagnostics"
+handle = "product-health-diagnostics"
+type = "ui_extension"
+
+[[extensions.targeting]]
+module = "./src/Block.jsx"
+target = "admin.product-details.block.render"

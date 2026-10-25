@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
 import { runStoreScan } from "../services/scanner.server";
 import prisma from "../db.server";
 
@@ -34,6 +35,7 @@ export const loader = async ({ request }) => {
   }
 
   return {
+    shop,
     scans,
     auditLogs,
     stats: {
@@ -46,13 +48,13 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "trigger_scan") {
     try {
-      const scanData = await runStoreScan(admin, session.shop);
+      const scanData = await runStoreScan(admin, shop);
       return { success: true, message: `Diagnostic scan complete. Found ${scanData.stats.total} total findings.` };
     } catch (err) {
       return { success: false, error: err.message };
@@ -63,14 +65,17 @@ export const action = async ({ request }) => {
 };
 
 export default function ScanHistoryPage() {
-  const { scans, auditLogs, stats } = useLoaderData();
+  const { shop, scans, auditLogs, stats } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activeTab, setActiveTab] = useState("scans"); // 'scans' | 'audit'
   const isScanning = fetcher.state !== "idle";
 
   const handleTriggerScan = () => {
-    fetcher.submit({ intent: "trigger_scan" }, { method: "post" });
+    fetcher.submit(
+      { intent: "trigger_scan", shop: shop || "" },
+      { method: "post" }
+    );
   };
 
   return (
@@ -264,13 +269,34 @@ export default function ScanHistoryPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Scan ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while loading audit history.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load scan history</div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while loading audit history."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

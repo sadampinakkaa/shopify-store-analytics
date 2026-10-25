@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
+import { getShopifyAdminUrl } from "../utils/navigation.js";
 import { runStoreScan } from "../services/scanner.server";
 import { executeAppFix } from "../services/fixes.server";
 import prisma from "../db.server";
@@ -79,8 +81,8 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { admin, session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "app_fix") {
@@ -90,7 +92,7 @@ export const action = async ({ request }) => {
     const resourceTitle = formData.get("resourceTitle");
 
     try {
-      const result = await executeAppFix(admin, session.shop, {
+      const result = await executeAppFix(admin, shop, {
         problemId,
         actionKey,
         resourceId,
@@ -103,15 +105,28 @@ export const action = async ({ request }) => {
     }
   }
 
+  if (intent === "ignore_problem") {
+    const problemId = formData.get("problemId");
+    try {
+      await executeAppFix(admin, shop, {
+        problemId,
+        actionKey: "IGNORE_PROBLEM",
+      });
+      return { success: true, message: "Problem dismissed from active queue.", ignoredId: problemId };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
   if (intent === "bulk_fix") {
     try {
       const activeFixables = await prisma.problem.findMany({
-        where: { shop: session.shop, fixType: "APP_FIX", resolvedAt: null },
+        where: { shop, fixType: "APP_FIX", resolvedAt: null },
       });
       let count = 0;
       for (const prob of activeFixables) {
         try {
-          await executeAppFix(admin, session.shop, {
+          await executeAppFix(admin, shop, {
             problemId: prob.id,
             actionKey: prob.actionKey,
             resourceId: prob.resourceId,
@@ -122,7 +137,7 @@ export const action = async ({ request }) => {
           console.warn(`Bulk fix item failed for ${prob.id}:`, itemErr.message);
         }
       }
-      await runStoreScan(admin, session.shop);
+      await runStoreScan(admin, shop);
       return { success: true, message: `Successfully resolved ${count} issue(s) in 1-click!` };
     } catch (err) {
       return { success: false, error: err.message };
@@ -130,7 +145,7 @@ export const action = async ({ request }) => {
   }
 
   if (intent === "run_scan") {
-    const scanData = await runStoreScan(admin, session.shop);
+    const scanData = await runStoreScan(admin, shop);
     return { success: true, message: "Diagnostic scan completed successfully." };
   }
 
@@ -138,7 +153,7 @@ export const action = async ({ request }) => {
 };
 
 export default function ProblemsPage() {
-  const { problems, resolvedProblems = [], healthScore, stats, totalProductsScanned } = useLoaderData();
+  const { shop, problems, resolvedProblems = [], healthScore, stats, totalProductsScanned } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activeFilter, setActiveFilter] = useState("all"); // 'all' | 'critical' | 'warning' | 'notice' | 'app_fix' | 'resolved'
@@ -146,41 +161,50 @@ export default function ProblemsPage() {
 
   const isScanning = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "run_scan";
   const isBulkFixing = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "bulk_fix";
+  const isFixing = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "app_fix";
 
   useEffect(() => {
     if (fetcher.data?.success && fetcher.data?.fixedId) {
       setFixedProblemIds((prev) => new Set([...prev, fetcher.data.fixedId]));
+    }
+    if (fetcher.data?.success && fetcher.data?.ignoredId) {
+      setFixedProblemIds((prev) => new Set([...prev, fetcher.data.ignoredId]));
     }
     if (fetcher.data?.success && fetcher.formData?.get("intent") === "bulk_fix") {
       setFixedProblemIds(new Set());
     }
   }, [fetcher.data]);
 
-  const handleFix = (problem) => {
-    const actionKey = problem.actionKey || (
-      problem.id?.startsWith("out-of-stock-") ? "FIX_OUT_OF_STOCK" :
-      problem.id?.startsWith("missing-desc-") ? "FIX_MISSING_DESCRIPTION" :
-      problem.id?.startsWith("missing-seo-") ? "FIX_SEO_METADATA" : ""
-    );
-
+  const submitAction = (payload) => {
     fetcher.submit(
-      {
-        intent: "app_fix",
-        problemId: problem.id,
-        actionKey,
-        resourceId: problem.resourceId,
-        resourceTitle: problem.resourceTitle,
-      },
-      { method: "post", action: "/app/problems" }
+      { shop: shop || "", ...payload },
+      { method: "post" }
     );
+  };
+
+  const handleFix = (problem) => {
+    submitAction({
+      intent: "app_fix",
+      problemId: problem.id,
+      actionKey: problem.actionKey || "",
+      resourceId: problem.resourceId || "",
+      resourceTitle: problem.resourceTitle || problem.title,
+    });
+  };
+
+  const handleIgnore = (problemId) => {
+    submitAction({
+      intent: "ignore_problem",
+      problemId,
+    });
   };
 
   const handleRunScan = () => {
-    fetcher.submit({ intent: "run_scan" }, { method: "post", action: "/app/problems" });
+    submitAction({ intent: "run_scan" });
   };
 
   const handleBulkFix = () => {
-    fetcher.submit({ intent: "bulk_fix" }, { method: "post", action: "/app/problems" });
+    submitAction({ intent: "bulk_fix" });
   };
 
   const appFixableCount = problems.filter((p) => p.fixType === "APP_FIX" && !fixedProblemIds.has(p.id)).length;
@@ -414,9 +438,9 @@ export default function ProblemsPage() {
                       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
                         <span className="sa-badge success">Remediated</span>
                         <a
-                          href={prob.resourceUrl}
+                          href={getShopifyAdminUrl(shop, prob.resourceType || "products", prob.resourceId || prob.resourceUrl)}
                           target="_blank"
-                          rel="noreferrer"
+                          rel="noopener noreferrer"
                           className="sa-btn sa-btn-ghost"
                           style={{ whiteSpace: "nowrap", fontSize: 12 }}
                         >
@@ -425,32 +449,58 @@ export default function ProblemsPage() {
                       </div>
                     ) : prob.fixType === "APP_FIX" ? (
                       <>
-                        <button
-                          className="sa-btn sa-btn-primary"
-                          onClick={() => handleFix(prob)}
-                          disabled={isFixing}
-                          style={{ whiteSpace: "nowrap" }}
-                        >
-                          {isFixing ? "Applying Fix..." : "⚡ 1-Click Fix"}
-                        </button>
+                        <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                          <button
+                            className="sa-btn sa-btn-primary"
+                            onClick={() => handleFix(prob)}
+                            disabled={isFixing}
+                            style={{ whiteSpace: "nowrap" }}
+                          >
+                            {isFixing && fetcher.formData?.get("problemId") === prob.id ? "Applying Fix..." : "⚡ 1-Click Fix"}
+                          </button>
+                          <button
+                            className="sa-btn sa-btn-ghost"
+                            onClick={() => handleIgnore(prob.id)}
+                            disabled={fetcher.state !== "idle"}
+                            style={{ whiteSpace: "nowrap", padding: "4px 8px", fontSize: 12 }}
+                            title="Dismiss issue from active queue"
+                          >
+                            Dismiss
+                          </button>
+                        </div>
                         <div style={{ fontSize: 11, color: "var(--sa-text-muted)", marginTop: 4 }}>
                           {prob.actionKey === "FIX_OUT_OF_STOCK" || prob.id?.startsWith("out-of-stock-")
                             ? "Sets status to Draft"
                             : prob.actionKey === "FIX_MISSING_DESCRIPTION" || prob.id?.startsWith("missing-desc-")
                             ? "Generates description"
+                            : prob.actionKey === "FIX_MISSING_SKU" || prob.id?.startsWith("missing-sku-")
+                            ? "Assigns SKU identifier"
+                            : prob.actionKey === "FIX_ZERO_PRICE" || prob.id?.startsWith("zero-price-")
+                            ? "Fixes zero pricing"
                             : "Generates SEO tags"}
                         </div>
                       </>
                     ) : (
-                      <a
-                        href={prob.resourceUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="sa-btn sa-btn-ghost"
-                        style={{ whiteSpace: "nowrap" }}
-                      >
-                        Open in Shopify Admin ↗
-                      </a>
+                      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                        <button
+                          className="sa-btn sa-btn-ghost"
+                          onClick={() => handleIgnore(prob.id)}
+                          disabled={fetcher.state !== "idle"}
+                          style={{ whiteSpace: "nowrap", padding: "4px 8px", fontSize: 12 }}
+                          title="Dismiss issue from active queue"
+                        >
+                          Dismiss
+                        </button>
+                        <a
+                          href={getShopifyAdminUrl(shop, prob.resourceType || "products", prob.resourceId || prob.resourceUrl)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="sa-btn sa-btn-secondary"
+                          style={{ whiteSpace: "nowrap" }}
+                        >
+                          Open in Shopify ↗
+                        </a>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -534,20 +584,8 @@ export default function ProblemsPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
-  return (
-    <div className="sa-page sa-fade-in">
-      <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
-        <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
-        <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load store diagnostics</div>
-        <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while running store diagnostics."}
-        </div>
-        <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
-          Retry
-        </button>
-      </div>
-    </div>
-  );
+  console.error("Problems ErrorBoundary caught error:", error);
+  return boundary.error(error);
 }
 
 export const headers = (headersArgs) => boundary.headers(headersArgs);

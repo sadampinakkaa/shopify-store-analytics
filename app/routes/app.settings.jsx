@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLoaderData, useFetcher, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { getActionAdmin } from "../services/auth.server.js";
 import prisma from "../db.server";
 
 export const loader = async ({ request }) => {
@@ -23,14 +24,15 @@ export const loader = async ({ request }) => {
   const scansThisMonth = await prisma.scan.count({ where: { shop } });
 
   return {
+    shop,
     sub,
     scansThisMonth,
   };
 };
 
 export const action = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const { session, shop } = await getActionAdmin(request, formData);
   const intent = formData.get("intent");
 
   if (intent === "change_plan") {
@@ -38,7 +40,7 @@ export const action = async ({ request }) => {
     const limit = newPlan === "Enterprise" ? 1000 : newPlan === "Growth" ? 250 : 50;
 
     await prisma.subscription.update({
-      where: { shop: session.shop },
+      where: { shop },
       data: { plan: newPlan, scanLimit: limit },
     });
 
@@ -49,7 +51,7 @@ export const action = async ({ request }) => {
 };
 
 export default function SettingsPage() {
-  const { sub, scansThisMonth } = useLoaderData();
+  const { shop, sub, scansThisMonth } = useLoaderData();
   const fetcher = useFetcher();
 
   const [activePlan, setActivePlan] = useState(sub.plan);
@@ -58,7 +60,10 @@ export default function SettingsPage() {
 
   const handleSelectPlan = (plan) => {
     setActivePlan(plan);
-    fetcher.submit({ intent: "change_plan", plan }, { method: "post" });
+    fetcher.submit(
+      { intent: "change_plan", plan, shop: shop || "" },
+      { method: "post" }
+    );
   };
 
   const plans = [
@@ -293,13 +298,34 @@ export default function SettingsPage() {
 
 export function ErrorBoundary() {
   const error = useRouteError();
+  console.error("Settings ErrorBoundary caught error:", error);
+
+  try {
+    const shopifyBoundary = boundary.error(error);
+    if (shopifyBoundary) return shopifyBoundary;
+  } catch {
+    // fallback
+  }
+
+  let errorMessage = "An unexpected error occurred while loading settings.";
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (error && typeof error === "object") {
+    errorMessage =
+      error.data?.message ||
+      error.statusText ||
+      (typeof error.data === "string" ? error.data : "") ||
+      error.message ||
+      errorMessage;
+  }
+
   return (
     <div className="sa-page sa-fade-in">
       <div className="sa-card" style={{ padding: "var(--sa-space-6)", maxWidth: 640, margin: "40px auto", textAlign: "center" }}>
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>Unable to load settings</div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while loading settings."}
+          {errorMessage}
         </div>
         <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
           Retry

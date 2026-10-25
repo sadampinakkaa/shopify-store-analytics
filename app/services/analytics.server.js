@@ -31,6 +31,13 @@ export async function fetchStoreOrders(admin, sinceDate) {
               id
               name
               createdAt
+              displayFinancialStatus
+              displayFulfillmentStatus
+              customer {
+                id
+                displayName
+                email
+              }
               totalPriceSet {
                 shopMoney {
                   amount
@@ -87,17 +94,19 @@ export async function fetchStoreOrders(admin, sinceDate) {
   }
 }
 
-export async function fetchStoreCatalog(admin) {
+export async function fetchStoreCatalog(admin, queryFilter = "") {
   try {
     const res = await admin.graphql(
       `#graphql
-      query storeCatalogDetailed {
-        products(first: 250, query: "status:active") {
+      query storeCatalogDetailed($query: String) {
+        products(first: 250, query: $query) {
           edges {
             node {
               id
               title
               status
+              vendor
+              productType
               totalInventory
               createdAt
               featuredMedia {
@@ -116,6 +125,9 @@ export async function fetchStoreCatalog(admin) {
                     sku
                     barcode
                     inventoryQuantity
+                    inventoryItem {
+                      id
+                    }
                   }
                 }
               }
@@ -123,7 +135,12 @@ export async function fetchStoreCatalog(admin) {
           }
           pageInfo { hasNextPage }
         }
-      }`
+      }`,
+      {
+        variables: {
+          query: queryFilter || null,
+        },
+      }
     );
     const json = await res.json();
     return json.data?.products?.edges?.map((e) => e.node) ?? [];
@@ -316,6 +333,28 @@ export function computeSalesAnalytics(orders, periodDates) {
   const bestDay = [...dayOfWeekBreakdown].sort((a, b) => b.gross_sales - a.gross_sales)[0];
   const slowestActiveDay = [...dayOfWeekBreakdown].sort((a, b) => a.gross_sales - b.gross_sales)[0];
 
+  // 4. Drill-down recent orders list for order level investigation
+  const recentOrders = currentOrders.slice(0, 50).map((o) => {
+    let orderUnits = 0;
+    for (const le of o.lineItems?.edges ?? []) {
+      orderUnits += le.node.quantity || 0;
+    }
+    const orderNumber = o.name || `#${o.id.split("/").pop()}`;
+    return {
+      id: o.id,
+      numericId: o.id.split("/").pop(),
+      name: orderNumber,
+      createdAt: o.createdAt,
+      total: parseFloat(o.totalPriceSet?.shopMoney?.amount || 0),
+      currency: o.totalPriceSet?.shopMoney?.currencyCode || "USD",
+      financialStatus: o.displayFinancialStatus || "PAID",
+      fulfillmentStatus: o.displayFulfillmentStatus || "UNFULFILLED",
+      customerName: o.customer?.displayName || (o.customer?.email ? o.customer.email.split("@")[0] : "Guest Shopper"),
+      customerEmail: o.customer?.email || null,
+      units: orderUnits,
+    };
+  });
+
   return {
     kpi: {
       grossSales: Math.round(grossSales * 100) / 100,
@@ -338,6 +377,7 @@ export function computeSalesAnalytics(orders, periodDates) {
     },
     trendRows,
     dayOfWeekBreakdown,
+    recentOrders,
     summary: {
       avgDailySales,
       avgDailyOrders,
@@ -448,6 +488,11 @@ export function computeProductIntelligence(products, orders, periodDays = 30) {
     return {
       id: p.id,
       title: p.title,
+      status: p.status || "ACTIVE",
+      vendor: p.vendor || "",
+      productType: p.productType || "",
+      sku: p.variants?.edges?.[0]?.node?.sku || "",
+      variantsCount: p.variants?.edges?.length || 1,
       imageUrl: p.featuredMedia?.preview?.image?.url || null,
       inventory,
       price: firstPrice,

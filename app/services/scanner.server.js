@@ -5,12 +5,16 @@ import prisma from "../db.server.js";
 // Classifies findings by CRITICAL / WARNING / NOTICE and APP_FIX / DEV_FIX.
 
 export async function runStoreScan(admin, shop) {
-  // Ensure store record exists in database
-  await prisma.store.upsert({
-    where: { shop },
-    create: { shop },
-    update: {},
-  });
+  // Ensure store record exists in database safely
+  try {
+    await prisma.store.upsert({
+      where: { shop },
+      create: { shop },
+      update: {},
+    });
+  } catch (storeErr) {
+    console.warn("Could not upsert store in DB cache:", storeErr.message);
+  }
 
   // Fetch full active catalog
   let products = [];

@@ -1,5 +1,5 @@
-import { useState, useMemo } from "react";
-import { useLoaderData, useFetcher, useRevalidator, useRouteError } from "react-router";
+import { useState, useMemo, useEffect } from "react";
+import { useLoaderData, useFetcher, useSearchParams, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
@@ -34,184 +34,223 @@ function fmtNum(val) {
   return new Intl.NumberFormat("en-US").format(val);
 }
 
-function fmtPct(val) {
-  if (val == null || isNaN(val)) return "0%";
-  return `${val >= 0 ? "+" : ""}${val.toFixed(1)}%`;
-}
-
 // ─── LOADER ───────────────────────────────────────────────────────────────────
 export const loader = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
-  const shop = session.shop;
-
-  const url = new URL(request.url);
-  const since = url.searchParams.get("since") || "-30d";
-  const periodDates = getPeriodDates(since);
-
-  // 1. Fetch Orders & Calculate Sales Analytics with Period-Over-Period Growth
-  let orders = [];
   try {
-    orders = await fetchStoreOrders(admin, periodDates.previousStartDate);
-  } catch (err) {
-    console.warn("Failed to fetch orders for dashboard:", err.message);
-  }
-  const salesAnalytics = computeSalesAnalytics(orders, periodDates);
+    const { admin, session } = await authenticate.admin(request);
+    const shop = session?.shop || "";
 
-  // 2. Fetch Catalog Snapshot
-  let catalog = [];
-  try {
-    catalog = await fetchStoreCatalog(admin);
-  } catch (err) {
-    console.warn("Failed to fetch catalog for dashboard:", err.message);
-  }
+    const url = new URL(request.url);
+    const since = url.searchParams.get("since") || "-30d";
+    const periodDates = getPeriodDates(since);
 
-  // 3. Retrieve or Execute Problem Diagnostic Scan
-  let dbProblems = [];
-  let resolvedCount = 0;
-  try {
-    dbProblems = await prisma.problem.findMany({
-      where: { shop, resolvedAt: null },
-      orderBy: { createdAt: "desc" },
-    });
-    resolvedCount = await prisma.problem.count({
-      where: { shop, resolvedAt: { not: null } },
-    });
-  } catch (err) {
-    console.warn("Database lookup caught in dashboard loader:", err.message);
-  }
-
-  // If no diagnostic problems in DB, run a full store scan automatically
-  let scanStats = null;
-  let healthScore = 100;
-  if (dbProblems.length === 0) {
+    // 1. Fetch Orders & Calculate Sales Analytics
+    let orders = [];
     try {
-      const scanResult = await runStoreScan(admin, shop);
-      dbProblems = scanResult.problems || [];
-      healthScore = scanResult.healthScore || 100;
-      scanStats = scanResult.stats;
-    } catch (scanErr) {
-      console.warn("Auto-scan failed in dashboard loader:", scanErr.message);
+      orders = await fetchStoreOrders(admin, periodDates.previousStartDate);
+    } catch (err) {
+      console.warn("Orders fetch caught in dashboard loader:", err.message);
     }
-  }
+    const salesAnalytics = computeSalesAnalytics(orders, periodDates);
 
-  // Calculate health metrics
-  const critCount = dbProblems.filter((p) => p.severity === "CRITICAL").length;
-  const warnCount = dbProblems.filter((p) => p.severity === "WARNING").length;
-  const notcCount = dbProblems.filter((p) => p.severity === "NOTICE").length;
+    // 2. Fetch Catalog Snapshot
+    let catalog = [];
+    try {
+      catalog = await fetchStoreCatalog(admin);
+    } catch (err) {
+      console.warn("Catalog fetch caught in dashboard loader:", err.message);
+    }
 
-  if (scanStats == null) {
-    healthScore = Math.max(0, 100 - (critCount * 15 + warnCount * 5 + notcCount * 2));
-    scanStats = {
-      critical: critCount,
-      warning: warnCount,
-      notice: notcCount,
-      total: dbProblems.length,
-      resolved: resolvedCount,
+    // 3. Retrieve or Execute Problem Diagnostic Scan
+    let dbProblems = [];
+    let resolvedCount = 0;
+    try {
+      dbProblems = await prisma.problem.findMany({
+        where: { shop, resolvedAt: null },
+        orderBy: { createdAt: "desc" },
+      });
+      resolvedCount = await prisma.problem.count({
+        where: { shop, resolvedAt: { not: null } },
+      });
+    } catch (err) {
+      console.warn("Database lookup caught in dashboard loader:", err.message);
+    }
+
+    // If no diagnostic problems in DB, run a scan safely
+    let scanStats = null;
+    let healthScore = 100;
+    if (dbProblems.length === 0) {
+      try {
+        const scanResult = await runStoreScan(admin, shop);
+        dbProblems = scanResult.problems || [];
+        healthScore = scanResult.healthScore || 100;
+        scanStats = scanResult.stats;
+      } catch (scanErr) {
+        console.warn("Auto-scan caught in dashboard loader:", scanErr.message);
+      }
+    }
+
+    // Calculate health metrics
+    const critCount = dbProblems.filter((p) => p.severity === "CRITICAL").length;
+    const warnCount = dbProblems.filter((p) => p.severity === "WARNING").length;
+    const notcCount = dbProblems.filter((p) => p.severity === "NOTICE").length;
+
+    if (scanStats == null) {
+      healthScore = Math.max(0, 100 - (critCount * 15 + warnCount * 5 + notcCount * 2));
+      scanStats = {
+        critical: critCount,
+        warning: warnCount,
+        notice: notcCount,
+        total: dbProblems.length,
+        resolved: resolvedCount,
+      };
+    }
+
+    // Category breakdown
+    const categoryCounts = {
+      inventory: dbProblems.filter((p) => p.category === "inventory").length,
+      product: dbProblems.filter((p) => p.category === "product").length,
+      seo: dbProblems.filter((p) => p.category === "seo").length,
+      performance: dbProblems.filter((p) => p.category === "performance").length,
+    };
+
+    // Customers calculation
+    const customerCounts = {};
+    for (const o of orders) {
+      const cid = o.customer?.id;
+      if (cid) customerCounts[cid] = (customerCounts[cid] || 0) + 1;
+    }
+    let newCust = 0;
+    let retCust = 0;
+    const custVals = Object.values(customerCounts);
+    if (custVals.length > 0) {
+      for (const cnt of custVals) {
+        if (cnt > 1) retCust++;
+        else newCust++;
+      }
+    } else {
+      newCust = salesAnalytics.kpi.orders;
+      retCust = 0;
+    }
+
+    // Catalog quick stats
+    const outOfStockCount = catalog.filter((p) => (p.totalInventory ?? 0) <= 0).length;
+    const lowStockCount = catalog.filter((p) => {
+      const inv = p.totalInventory ?? 0;
+      return inv > 0 && inv <= 5;
+    }).length;
+
+    return {
+      shop,
+      since,
+      kpi: salesAnalytics.kpi,
+      trendRows: salesAnalytics.trendRows,
+      summary: salesAnalytics.summary,
+      salesAnomalies: salesAnalytics.anomalies || [],
+      health: {
+        score: healthScore,
+        ...scanStats,
+        categories: categoryCounts,
+      },
+      topProblems: dbProblems.slice(0, 6),
+      catalogStats: {
+        total: catalog.length,
+        outOfStock: outOfStockCount,
+        lowStock: lowStockCount,
+      },
+      customers: {
+        new: newCust,
+        returning: retCust,
+        total: newCust + retCust,
+      },
+    };
+  } catch (fatalErr) {
+    console.error("Dashboard loader caught fatal exception gracefully:", fatalErr);
+    return {
+      shop: "",
+      since: "-30d",
+      kpi: { grossSales: 0, netSales: 0, orders: 0, unitsSold: 0, aov: 0 },
+      trendRows: [],
+      summary: { avgDailySales: 0, peakDay: null, lowestDay: null },
+      salesAnomalies: [],
+      health: {
+        score: 100,
+        critical: 0,
+        warning: 0,
+        notice: 0,
+        total: 0,
+        resolved: 0,
+        categories: { inventory: 0, product: 0, seo: 0, performance: 0 },
+      },
+      topProblems: [],
+      catalogStats: { total: 0, outOfStock: 0, lowStock: 0 },
+      customers: { new: 0, returning: 0, total: 0 },
     };
   }
-
-  // Category breakdown
-  const categoryCounts = {
-    inventory: dbProblems.filter((p) => p.category === "inventory").length,
-    product: dbProblems.filter((p) => p.category === "product").length,
-    seo: dbProblems.filter((p) => p.category === "seo").length,
-    performance: dbProblems.filter((p) => p.category === "performance").length,
-  };
-
-  // Customers calculation
-  const customerCounts = {};
-  for (const o of orders) {
-    const cid = o.customer?.id;
-    if (cid) customerCounts[cid] = (customerCounts[cid] || 0) + 1;
-  }
-  let newCust = 0;
-  let retCust = 0;
-  const custVals = Object.values(customerCounts);
-  if (custVals.length > 0) {
-    for (const cnt of custVals) {
-      if (cnt > 1) retCust++;
-      else newCust++;
-    }
-  } else {
-    newCust = salesAnalytics.kpi.orders;
-    retCust = 0;
-  }
-
-  // Catalog quick stats
-  const outOfStockCount = catalog.filter((p) => (p.totalInventory ?? 0) <= 0).length;
-  const lowStockCount = catalog.filter((p) => {
-    const inv = p.totalInventory ?? 0;
-    return inv > 0 && inv <= 5;
-  }).length;
-
-  return {
-    shop,
-    since,
-    kpi: salesAnalytics.kpi,
-    trendRows: salesAnalytics.trendRows,
-    summary: salesAnalytics.summary,
-    salesAnomalies: salesAnalytics.anomalies || [],
-    health: {
-      score: healthScore,
-      ...scanStats,
-      categories: categoryCounts,
-    },
-    topProblems: dbProblems.slice(0, 6),
-    catalogStats: {
-      total: catalog.length,
-      outOfStock: outOfStockCount,
-      lowStock: lowStockCount,
-    },
-    customers: {
-      new: newCust,
-      returning: retCust,
-      total: newCust + retCust,
-    },
-  };
 };
 
 // ─── ACTION ───────────────────────────────────────────────────────────────────
 export const action = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
-  const formData = await request.formData();
-  const intent = formData.get("intent");
+  try {
+    const { admin, session } = await authenticate.admin(request);
+    const formData = await request.formData();
+    const intent = formData.get("intent");
 
-  if (intent === "quick_fix") {
-    const problemId = formData.get("problemId");
-    const actionKey = formData.get("actionKey");
-    const resourceId = formData.get("resourceId");
-    const resourceTitle = formData.get("resourceTitle");
-
-    try {
-      const result = await executeAppFix(admin, session.shop, {
-        problemId,
-        actionKey,
-        resourceId,
-        resourceTitle,
-      });
-      return {
-        success: true,
-        message: result?.message || "Remediation applied successfully!",
-        fixedId: problemId,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Failed to execute fix." };
+    if (intent === "sync_store") {
+      try {
+        const scanData = await runStoreScan(admin, session.shop);
+        return {
+          success: true,
+          message: `Store synced! Scanned ${scanData.totalProductsScanned} catalog products. Health Score: ${scanData.healthScore}/100.`,
+          actionType: "sync",
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Sync encountered an error." };
+      }
     }
-  }
 
-  if (intent === "rescan") {
-    try {
-      const scanData = await runStoreScan(admin, session.shop);
-      return {
-        success: true,
-        message: `Diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health score: ${scanData.healthScore}/100.`,
-      };
-    } catch (err) {
-      return { success: false, error: err.message || "Scan failed." };
+    if (intent === "run_scan" || intent === "rescan") {
+      try {
+        const scanData = await runStoreScan(admin, session.shop);
+        return {
+          success: true,
+          message: `Full diagnostic scan complete! Analyzed ${scanData.totalProductsScanned} products. Health Score: ${scanData.healthScore}/100.`,
+          actionType: "scan",
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Diagnostic scan failed." };
+      }
     }
-  }
 
-  return { success: false, error: "Invalid action intent" };
+    if (intent === "quick_fix") {
+      const problemId = formData.get("problemId");
+      const actionKey = formData.get("actionKey");
+      const resourceId = formData.get("resourceId");
+      const resourceTitle = formData.get("resourceTitle");
+
+      try {
+        const result = await executeAppFix(admin, session.shop, {
+          problemId,
+          actionKey,
+          resourceId,
+          resourceTitle,
+        });
+        return {
+          success: true,
+          message: result?.message || "Remediation applied successfully!",
+          fixedId: problemId,
+          actionType: "fix",
+        };
+      } catch (err) {
+        return { success: false, error: err.message || "Failed to execute fix." };
+      }
+    }
+
+    return { success: false, error: "Invalid action intent" };
+  } catch (err) {
+    console.error("Action error caught safely:", err);
+    return { success: false, error: err.message || "Failed to process request." };
+  }
 };
 
 // ─── HEALTH RING SVG ──────────────────────────────────────────────────────────
@@ -325,7 +364,7 @@ function MetricCard({ label, value, delta, accent = "var(--sa-emerald)", sparkDa
   );
 }
 
-// ─── DASHBOARD PAGE ───────────────────────────────────────────────────────────
+// ─── DASHBOARD PAGE COMPONENT ─────────────────────────────────────────────────
 export default function OverviewPage() {
   const {
     shop,
@@ -340,16 +379,27 @@ export default function OverviewPage() {
     customers,
   } = useLoaderData();
 
-  const revalidator = useRevalidator();
+  const [searchParams, setSearchParams] = useSearchParams();
   const actionFetcher = useFetcher();
 
-  const [activePeriod, setActivePeriod] = useState(
-    DATE_RANGES.findIndex((r) => r.sinceExpr === since) !== -1
-      ? DATE_RANGES.findIndex((r) => r.sinceExpr === since)
-      : 1
-  );
+  const activeSince = searchParams.get("since") || since || "-30d";
+  const activePeriodIdx = useMemo(() => {
+    const idx = DATE_RANGES.findIndex((r) => r.sinceExpr === activeSince);
+    return idx !== -1 ? idx : 1;
+  }, [activeSince]);
 
   const [chartView, setChartView] = useState("revenue"); // 'revenue' | 'orders'
+  const [toastMessage, setToastMessage] = useState(null);
+
+  // Monitor action response cleanly without state mutation
+  useEffect(() => {
+    if (actionFetcher.data) {
+      setToastMessage({
+        success: actionFetcher.data.success,
+        text: actionFetcher.data.message || actionFetcher.data.error,
+      });
+    }
+  }, [actionFetcher.data]);
 
   const revenueSparkData = trendRows.map((r) => r.gross_sales ?? 0);
   const ordersSparkData = trendRows.map((r) => r.orders ?? 0);
@@ -358,17 +408,21 @@ export default function OverviewPage() {
   const returningRate =
     totalCustomers > 0 ? `${((customers.returning / totalCustomers) * 100).toFixed(0)}%` : "0%";
 
-  const handlePeriodChange = (idx) => {
-    setActivePeriod(idx);
-    const { sinceExpr } = DATE_RANGES[idx];
-    const url = new URL(window.location.href);
-    url.searchParams.set("since", sinceExpr);
-    window.history.pushState({}, "", url);
-    revalidator.revalidate();
+  // Declarative period change using React Router search params
+  const handlePeriodChange = (sinceExpr) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set("since", sinceExpr);
+      return next;
+    });
+  };
+
+  const handleSyncStore = () => {
+    actionFetcher.submit({ intent: "sync_store" }, { method: "POST" });
   };
 
   const handleRunScan = () => {
-    actionFetcher.submit({ intent: "rescan" }, { method: "POST" });
+    actionFetcher.submit({ intent: "run_scan" }, { method: "POST" });
   };
 
   const handleQuickFix = (problem) => {
@@ -384,63 +438,92 @@ export default function OverviewPage() {
     );
   };
 
-  const isScanning = actionFetcher.state === "submitting" && actionFetcher.formData?.get("intent") === "rescan";
+  const isSyncing = actionFetcher.state === "submitting" && actionFetcher.formData?.get("intent") === "sync_store";
+  const isScanning = actionFetcher.state === "submitting" && actionFetcher.formData?.get("intent") === "run_scan";
 
   return (
     <div className="sa-page sa-fade-in">
-      {/* Header */}
+      {/* Header exactly matching requirement & screenshot */}
       <div className="sa-page-header">
         <div>
-          <div className="sa-page-title">Store Diagnostics & Analytics Dashboard</div>
+          <div className="sa-page-title">Store Diagnostics & Performance Radar</div>
           <div className="sa-page-subtitle">
-            Real-time store performance, catalog health, problem detection, and 1-click remediation
+            Automated defect detection, Core Web Vitals benchmarking, and 1-click remediation
           </div>
         </div>
         <div className="sa-inline">
+          {/* Date interval pills */}
           <div className="sa-date-pills">
             {DATE_RANGES.map((r, i) => (
               <button
                 key={r.label}
-                className={`sa-date-pill${activePeriod === i ? " active" : ""}`}
-                onClick={() => handlePeriodChange(i)}
+                className={`sa-date-pill${activePeriodIdx === i ? " active" : ""}`}
+                onClick={() => handlePeriodChange(r.sinceExpr)}
               >
                 {r.label}
               </button>
             ))}
           </div>
+
+          {/* Sync Store Button */}
+          <button
+            onClick={handleSyncStore}
+            disabled={isSyncing || isScanning}
+            className="sa-btn"
+            style={{
+              background: "var(--sa-surface)",
+              border: "1px solid var(--sa-border)",
+              color: "var(--sa-text)",
+              fontSize: 13,
+              fontWeight: 500,
+              padding: "6px 14px",
+              cursor: isSyncing ? "wait" : "pointer",
+            }}
+          >
+            {isSyncing ? "⚡ Syncing..." : "⚡ Sync Store"}
+          </button>
+
+          {/* Run Scan Button in vibrant orange */}
           <button
             onClick={handleRunScan}
-            disabled={isScanning}
-            className="sa-btn sa-btn-primary"
-            style={{ fontSize: 12, padding: "5px 14px" }}
+            disabled={isScanning || isSyncing}
+            className="sa-btn"
+            style={{
+              background: "linear-gradient(180deg, #d97706 0%, #b45309 100%)",
+              border: "1px solid #b45309",
+              color: "#ffffff",
+              fontSize: 13,
+              fontWeight: 600,
+              padding: "6px 14px",
+              cursor: isScanning ? "wait" : "pointer",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+            }}
           >
-            {isScanning ? "Scanning Catalog..." : "🔄 Run Diagnostics"}
+            {isScanning ? "🔄 Scanning..." : "🔄 Run Scan"}
           </button>
         </div>
       </div>
 
       {/* Action Notification Toast */}
-      {actionFetcher.data && (
+      {toastMessage && (
         <div
           className="sa-card"
           style={{
             marginBottom: "var(--sa-space-5)",
             padding: "12px 16px",
-            borderColor: actionFetcher.data.success ? "var(--sa-emerald)" : "var(--sa-rose)",
-            background: actionFetcher.data.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
+            borderColor: toastMessage.success ? "var(--sa-emerald)" : "var(--sa-rose)",
+            background: toastMessage.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span>{actionFetcher.data.success ? "✅" : "⚠️"}</span>
-            <div style={{ fontSize: 13, fontWeight: 500 }}>
-              {actionFetcher.data.message || actionFetcher.data.error}
-            </div>
+            <span>{toastMessage.success ? "✅" : "⚠️"}</span>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>{toastMessage.text}</div>
           </div>
           <button
-            onClick={() => (actionFetcher.data = null)}
+            onClick={() => setToastMessage(null)}
             className="sa-btn sa-btn-ghost"
             style={{ padding: "2px 8px", fontSize: 11 }}
           >
@@ -449,35 +532,7 @@ export default function OverviewPage() {
         </div>
       )}
 
-      {/* High-Priority Diagnostic Banner if Critical Problems Exist */}
-      {health.critical > 0 && (
-        <div
-          className="sa-card"
-          style={{
-            marginBottom: "var(--sa-space-6)",
-            borderColor: "rgba(244, 63, 94, 0.4)",
-            background: "linear-gradient(180deg, rgba(244, 63, 94, 0.08) 0%, var(--sa-surface) 100%)",
-            padding: "14px 18px",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span style={{ fontSize: 22 }}>🚨</span>
-              <div>
-                <div style={{ fontWeight: 700, fontSize: 14, color: "var(--sa-rose)" }}>
-                  {health.critical} Critical Store {health.critical === 1 ? "Problem" : "Problems"} Requiring Attention
-                </div>
-                <div className="sa-text-muted" style={{ fontSize: 12 }}>
-                  Critical issues directly impact customer checkout or conversion (e.g. out-of-stock active products or pricing errors).
-                </div>
-              </div>
-            </div>
-            <a href="/app/problems" className="sa-btn sa-btn-danger" style={{ fontSize: 12, padding: "5px 12px" }}>
-              Review & Fix All →
-            </a>
-          </div>
-        </div>
-      )}
+      {/* NOTE: The '6 Critical Store Issues Require Immediate Attention' banner has been completely removed as requested */}
 
       {/* Metrics Row with Comparative Growth */}
       <div className="sa-metrics-grid">
@@ -903,14 +958,19 @@ export function ErrorBoundary() {
       >
         <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <div className="sa-card-title" style={{ fontSize: 18, marginBottom: 8 }}>
-          Unable to load dashboard
+          Dashboard Diagnostics Notice
         </div>
         <div className="sa-text-muted" style={{ marginBottom: 16 }}>
-          {error?.message || "An unexpected error occurred while fetching analytics."}
+          {error?.message || "Unexpected Server Error"}
         </div>
-        <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
-          Retry
-        </button>
+        <div style={{ display: "flex", justifyContent: "center", gap: 12 }}>
+          <button className="sa-btn sa-btn-primary" onClick={() => window.location.reload()}>
+            🔄 Reload Dashboard
+          </button>
+          <a href="/app" className="sa-btn sa-btn-secondary">
+            Return to Overview
+          </a>
+        </div>
       </div>
     </div>
   );

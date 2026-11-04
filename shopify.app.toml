@@ -22,10 +22,6 @@ api_version = "2026-10"
   topics = [ "app/scopes_update" ]
 
   [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/create"
-  topics = [ "orders/create" ]
-
-  [[webhooks.subscriptions]]
   uri = "/webhooks/products/update"
   topics = [ "products/update" ]
 
@@ -45,4 +41,5 @@ api_version = "2026-10"
 redirect_urls = [ "https://analytics.pinakkaa.com/api/auth" ]
 
 [build]
+include_config_on_deploy = true
 automatically_update_urls_on_dev = true

@@ -3,6 +3,8 @@ api_version = "2026-10"
 [[extensions]]
 name = "Product Health & Diagnostics"
 handle = "product-health-diagnostics"
+
+uid = "6b1cdcbf-7885-b6d8-0295-f6df6fe845afba4be67a"
 type = "ui_extension"
 
 [[extensions.targeting]]

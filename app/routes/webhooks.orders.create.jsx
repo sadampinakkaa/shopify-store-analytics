@@ -2,7 +2,19 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
 export const action = async ({ request }) => {
-  const { shop, topic, payload } = await authenticate.webhook(request);
+  let webhook;
+  try {
+    webhook = await authenticate.webhook(request);
+  } catch (error) {
+    if (error instanceof Response) return error;
+    console.error(
+      "[Store Analytics Webhook] Authentication failed for orders/create:",
+      error?.message || error
+    );
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const { shop, topic, payload } = webhook;
   console.log(`[Store Analytics Webhook] Received ${topic} for ${shop}`);
 
   if (!payload || !shop) {
